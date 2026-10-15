@@ -489,9 +489,11 @@ These files are PlayOut's protected core. Each change needs the owner's approval
 - Settings: fallback clip, `STALL` ticks, queue depth.
 - Keep the stock code path for a stock server (`QUEUE 1-10 INFO` answers `400`).
 
-### 8.4 Starting and stopping the engine (done in PlayOut)
+### 8.4 Starting and stopping the engine (patch ready, not applied)
 
-`src-tauri/src/caspar_process.rs` (not protected core) now:
+This change is written and tested, but PlayOutVue stays untouched until the integration. It is
+kept as `tools/playout-integration/caspar_process-stdin-exit.patch` (base: PlayOutVue `6fa3e38`).
+With it, `src-tauri/src/caspar_process.rs` (not protected core):
 
 - starts `casparcg.exe` with a stdin pipe and keeps it open while the engine runs. With stdin at
   end-of-file, stock 2.5.1 spins one CPU core (§6); with the pipe open both servers idle at about
