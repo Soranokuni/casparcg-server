@@ -115,21 +115,48 @@ class stage_base
 
 /**
  * PlayOut fork: synchronous access to a stage. Only valid on the stage thread, that is inside
- * stage_base::invoke_sync.
+ * stage_base::invoke_sync or a captured_op.
  */
 class stage_sync_ops
 {
   public:
+    using transform_func_t = stage_base::transform_func_t;
+
     virtual ~stage_sync_ops() {}
+
+    virtual void load(int                                    index,
+                      const spl::shared_ptr<frame_producer>& producer,
+                      bool                                   preview,
+                      bool                                   auto_play,
+                      const item_info&                       info,
+                      bool                                   clear_queue)                                         = 0;
+    virtual void preview(int index)                                                                                = 0;
+    virtual void pause(int index)                                                                                  = 0;
+    virtual void resume(int index)                                                                                 = 0;
+    virtual void play(int index)                                                                                   = 0;
+    virtual void stop(int index)                                                                                   = 0;
+    virtual void clear(int index)                                                                                  = 0;
+    virtual void clear()                                                                                           = 0;
+    virtual void call(int index, const std::vector<std::wstring>& params)                                         = 0;
+    virtual void callbg(int index, const std::vector<std::wstring>& params)                                       = 0;
+    virtual void apply_transforms(const std::vector<stage_base::transform_tuple_t>& transforms)                    = 0;
+    virtual void apply_transform(int index, const transform_func_t& transform, unsigned int mix_duration, const tweener& tween) = 0;
+    virtual void clear_transforms(int index)                                                                       = 0;
+    virtual void clear_transforms()                                                                                = 0;
 
     // The layer at index, created when it does not exist.
     virtual layer& get_layer(int index) = 0;
     // The layer at index, or nullptr.
     virtual layer* find_layer(int index) = 0;
 
+    // Applies the stage operations, then calls the deferred work.
+    virtual void run_actions(const item_actions& actions) = 0;
+
     // The layer's event log: events with seq > since, oldest first.
     virtual std::vector<layer_event> events(int index, std::uint64_t since) const = 0;
     virtual std::uint64_t            last_event_seq(int index) const               = 0;
+    // Adds an event; it gets the frame of the next tick.
+    virtual void log_event(int index, const std::string& kind, const std::wstring& tag, const std::string& reason) = 0;
 
     // Channel frame counter of the last tick.
     virtual std::uint64_t frame() const = 0;
@@ -252,6 +279,56 @@ class stage_delayed final : public stage_base
     std::promise<void>      waiter_;
     std::shared_ptr<stage>& stage_;
     executor                executor_;
+};
+
+/**
+ * PlayOut fork: a stage that records operations instead of running them, for ONAIR. The command
+ * creates its producers when it is recorded; the recorded operations run later on the real stage,
+ * inside the tick in which the item goes on air. Calls and queries answer at once with empty values.
+ */
+class stage_capture final : public stage_base
+{
+  public:
+    std::vector<captured_op> take_ops() { return std::move(ops_); }
+
+    std::future<void>            apply_transforms(const std::vector<transform_tuple_t>& transforms) override;
+    std::future<void>            apply_transform(int                     index,
+                                                 const transform_func_t& transform,
+                                                 unsigned int            mix_duration,
+                                                 const tweener&          tween) override;
+    std::future<void>            clear_transforms(int index) override;
+    std::future<void>            clear_transforms() override;
+    std::future<frame_transform> get_current_transform(int index) override;
+    std::future<void>            load(int                                    index,
+                                      const spl::shared_ptr<frame_producer>& producer,
+                                      bool                                   preview     = false,
+                                      bool                                   auto_play   = false,
+                                      item_info                              info        = {},
+                                      bool                                   clear_queue = false) override;
+    std::future<void>            preview(int index) override;
+    std::future<void>            pause(int index) override;
+    std::future<void>            resume(int index) override;
+    std::future<void>            play(int index) override;
+    std::future<void>            stop(int index) override;
+    std::future<std::wstring>    call(int index, const std::vector<std::wstring>& params) override;
+    std::future<std::wstring>    callbg(int index, const std::vector<std::wstring>& params) override;
+    std::future<void>            clear(int index) override;
+    std::future<void>            clear() override;
+    std::future<void>            swap_layers(const std::shared_ptr<stage_base>& other, bool swap_transforms) override;
+    std::future<void>            swap_layer(int index, int other_index, bool swap_transforms) override;
+    std::future<void>
+    swap_layer(int index, int other_index, const std::shared_ptr<stage_base>& other, bool swap_transforms) override;
+
+    std::future<std::shared_ptr<frame_producer>> foreground(int index) override;
+    std::future<std::shared_ptr<frame_producer>> background(int index) override;
+
+    std::future<void> execute(std::function<void()> k) override;
+    std::future<void> invoke_sync(std::function<void(stage_sync_ops&)> func) override;
+
+  private:
+    std::future<void> record(captured_op op);
+
+    std::vector<captured_op> ops_;
 };
 
 }} // namespace caspar::core

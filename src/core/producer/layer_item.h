@@ -17,13 +17,15 @@
  * along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
  */
 
-// PlayOut fork: item identity (TAG), the wait queue (QUEUE) and the layer event log (EVENTS). See
-// PLAYOUT-FORK.md in the repository root.
+// PlayOut fork: item identity (TAG), on-air actions (ONAIR), the wait queue (QUEUE) and the layer
+// event log (EVENTS). See PLAYOUT-FORK.md in the repository root.
 
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,10 +33,26 @@ namespace caspar { namespace core {
 
 class stage_sync_ops;
 
-// Identity of an item on a layer.
+// A stage operation recorded ahead of time. It runs on the stage thread.
+using captured_op = std::function<void(stage_sync_ops&)>;
+
+// Work attached to an item that runs when the item goes on air.
+struct item_actions
+{
+    // Applied inside the tick in which the item goes on air, before any layer is drawn, so their
+    // result shows on the same frame as the item's first frame.
+    std::vector<captured_op> stage_ops;
+
+    // Work that cannot run inside the tick (CG commands). Called once, on the stage thread, right
+    // after stage_ops. Must not block: it only hands the work to another thread.
+    std::vector<std::function<void()>> deferred;
+};
+
+// Identity and on-air actions of an item on a layer.
 struct item_info
 {
-    std::wstring tag;
+    std::wstring                  tag;
+    std::shared_ptr<item_actions> actions;
 };
 
 // One entry in a layer's event log.

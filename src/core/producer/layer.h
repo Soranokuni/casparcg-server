@@ -59,8 +59,9 @@ class layer final
     void stop();
 
     // PlayOut fork: runs once per tick, before receive(). Promotes an AUTO background and reports
-    // the end of the foreground.
-    void prepare();
+    // the end of the foreground. Returns the actions of the items that went on air since the last
+    // call.
+    std::vector<std::shared_ptr<item_actions>> prepare();
 
     draw_frame receive(const video_field field, int nb_samples);
     draw_frame receive_background(const video_field field, int nb_samples);
@@ -73,12 +74,20 @@ class layer final
 
     // PlayOut fork: the wait queue. The background is the head of the queue: when it goes on air,
     // the next queued item moves into the background.
+    enum class attach_result
+    {
+        not_found,
+        attached,
+        on_air,
+    };
+
     const std::wstring& foreground_tag() const;
     void                queue_push(spl::shared_ptr<frame_producer> producer, bool auto_play, item_info info);
     // Removes the waiting items after the item tagged after_tag (all of them when after_tag is
     // empty or on air). Returns the number removed, or -1 when after_tag is not on the layer.
     int           queue_clear(const std::wstring& after_tag);
     bool          queue_remove(const std::wstring& tag);
+    attach_result attach_actions(const std::wstring& tag, const std::shared_ptr<item_actions>& actions);
     void          on_clear();
     std::vector<layer_event> take_events();
     layer_snapshot           snapshot() const;

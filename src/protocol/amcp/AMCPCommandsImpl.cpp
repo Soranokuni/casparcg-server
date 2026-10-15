@@ -64,8 +64,10 @@
 #include <chrono>
 #include <fstream>
 #include <future>
+#include <list>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 
 #include <boost/algorithm/string.hpp>
@@ -423,7 +425,7 @@ std::wstring loadbg(command_context& ctx, bool clear_queue)
     core::diagnostics::call_context::for_thread().layer         = ctx.layer_index();
 
     auto                  channel = ctx.channel.raw_channel;
-    const core::item_info info{take_tag(ctx.parameters, 1)};
+    const core::item_info info{take_tag(ctx.parameters, 1), nullptr};
     bool                  auto_play = contains_param(L"AUTO", ctx.parameters);
 
     try {
@@ -460,7 +462,7 @@ std::wstring load_command(command_context& ctx)
         // Must be a promoting load
         ctx.channel.stage->preview(ctx.layer_index());
     } else {
-        const core::item_info info{take_tag(ctx.parameters, 1)};
+        const core::item_info info{take_tag(ctx.parameters, 1), nullptr};
         try {
             auto new_producer = ctx.static_context->producer_registry->create_producer(
                 get_producer_dependencies(ctx.channel.raw_channel, ctx), ctx.parameters);
@@ -1847,7 +1849,7 @@ std::wstring osc_unsubscribe_command(command_context& ctx)
     return L"202 OSC UNSUBSCRIBE OK\r\n";
 }
 
-// PlayOut fork: QUEUE and EVENTS. See PLAYOUT-FORK.md.
+// PlayOut fork: QUEUE, ONAIR and EVENTS. See PLAYOUT-FORK.md.
 
 // QUEUE 1-10 <clip> [producer parameters] [transition] [AUTO] [TAG <tag>] [EXPECT <tag>]
 std::future<std::wstring> queue_command(command_context& ctx)
@@ -1857,7 +1859,7 @@ std::future<std::wstring> queue_command(command_context& ctx)
     core::diagnostics::call_context::for_thread().layer         = ctx.layer_index();
 
     const auto            expect = take_expect(ctx.parameters, 1);
-    const core::item_info info{take_tag(ctx.parameters, 1)};
+    const core::item_info info{take_tag(ctx.parameters, 1), nullptr};
     const bool            auto_play = contains_param(L"AUTO", ctx.parameters);
     const auto            producer  = create_background_producer(ctx);
     const int             index     = ctx.layer_index();
@@ -1989,6 +1991,152 @@ std::future<std::wstring> events_command(command_context& ctx)
     });
 }
 
+enum class onair_kind
+{
+    captured, // runs inside the tick in which the item goes on air
+    deferred, // runs right after that tick, on the onair executor
+    rejected,
+};
+
+// A live input (DeckLink, Bluefish, NDI). Recording the command would open the device when the ONAIR
+// arrives, maybe minutes early and while another producer still holds the same input.
+bool opens_live_input(const AMCPCommand& command)
+{
+    const auto& params = command.parameters();
+    if (params.empty())
+        return false;
+
+    const auto& first = params.at(0);
+    return boost::iequals(first, L"DECKLINK") || boost::iequals(first, L"BLUEFISH") ||
+           boost::iequals(first, L"[NDI]") || boost::istarts_with(first, L"ndi:");
+}
+
+onair_kind classify_onair_command(const AMCPCommand& command)
+{
+    static const std::set<std::wstring> stage_commands = {
+        L"LOADBG", L"LOAD", L"PLAY", L"PAUSE", L"RESUME", L"STOP", L"CALL", L"CALLBG", L"MIXER CLEAR"};
+
+    const auto& name = command.name();
+
+    // CLEAR of a whole channel would also clear the item that goes on air.
+    if (name == L"CLEAR")
+        return command.layer_index() >= 0 ? onair_kind::captured : onair_kind::rejected;
+
+    if ((name == L"LOADBG" || name == L"LOAD" || name == L"PLAY") && opens_live_input(command))
+        return onair_kind::deferred;
+
+    if (stage_commands.count(name) > 0)
+        return onair_kind::captured;
+
+    if (boost::starts_with(name, L"MIXER ")) {
+        // COMMIT and MASTERVOLUME bypass the stage. Without parameters it is a query. DEFER keeps the
+        // transform outside the stage until MIXER COMMIT.
+        if (name == L"MIXER COMMIT" || name == L"MIXER MASTERVOLUME" || command.parameters().empty() ||
+            contains_param(L"DEFER", command.parameters()))
+            return onair_kind::rejected;
+        return onair_kind::captured;
+    }
+
+    // CG commands work on the channel directly, so they cannot be recorded.
+    if (boost::starts_with(name, L"CG "))
+        return onair_kind::deferred;
+
+    return onair_kind::rejected;
+}
+
+// ONAIR 1-10 <tag> <command>: runs <command> when the item tagged <tag> on layer 10 goes on air,
+// or at once when it is already on air. Stage commands show on the item's first frame.
+std::future<std::wstring> onair_command(command_context& ctx)
+{
+    const auto tag           = check_tag(ctx.parameters.at(0));
+    const int  layer_index   = ctx.layer_index();
+    const int  channel_index = ctx.channel_index;
+    const auto repo          = ctx.static_context->parser;
+
+    std::list<std::wstring> tokens(ctx.parameters.begin() + 1, ctx.parameters.end());
+    if (tokens.empty())
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"ONAIR needs a command."));
+
+    const auto command = repo->parse_command(ctx.client, tokens, L"");
+    if (!command)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"ONAIR: unknown command."));
+    if (command->channel_index() != channel_index)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"ONAIR: the command must use the same channel."));
+
+    auto       actions       = std::make_shared<core::item_actions>();
+    const auto real_channels = repo->channels();
+
+    switch (classify_onair_command(*command)) {
+        case onair_kind::captured: {
+            // Run the command against a recording stage: it makes its producers now, and the
+            // recorded stage operations run later, inside the tick.
+            auto                                          capture = std::make_shared<core::stage_capture>();
+            spl::shared_ptr<std::vector<channel_context>> channels;
+            for (int n = 0; n < static_cast<int>(real_channels->size()); ++n) {
+                const auto& ch = real_channels->at(n);
+                channels->emplace_back(
+                    ch.raw_channel, n == channel_index ? capture : ch.stage, ch.lifecycle_key_);
+            }
+
+            const auto reply = command->Execute(channels).get();
+            if (reply.empty() || reply[0] != L'2')
+                return make_ready_future<std::wstring>(L"403 ONAIR FAILED\r\n");
+
+            actions->stage_ops = capture->take_ops();
+            break;
+        }
+        case onair_kind::deferred: {
+            std::weak_ptr<executor>    weak_executor = ctx.static_context->onair_executor;
+            std::weak_ptr<core::stage> weak_stage    = real_channels->at(channel_index).raw_channel->stage();
+
+            actions->deferred.push_back([weak_executor, weak_stage, command, real_channels, layer_index, tag] {
+                auto onair_executor = weak_executor.lock();
+                if (!onair_executor)
+                    return;
+
+                onair_executor->begin_invoke([weak_stage, command, real_channels, layer_index, tag] {
+                    std::wstring reply;
+                    try {
+                        reply = command->Execute(real_channels).get();
+                    } catch (...) {
+                        CASPAR_LOG_CURRENT_EXCEPTION();
+                    }
+
+                    if (!reply.empty() && reply[0] == L'2')
+                        return;
+
+                    const auto code = reply.size() >= 3 ? reply.substr(0, 3) : std::wstring(L"501");
+                    CASPAR_LOG(warning) << L"[onair] " << tag << L": " << command->name() << L" failed (" << code
+                                        << L").";
+
+                    if (auto stage = weak_stage.lock()) {
+                        const auto reason = u8(command->name() + L" " + code);
+                        stage->invoke_sync([layer_index, tag, reason](core::stage_sync_ops& s) {
+                            s.log_event(layer_index, "actionfailed", tag, reason);
+                        });
+                    }
+                });
+            });
+            break;
+        }
+        default:
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"ONAIR does not support " + command->name() + L"."));
+    }
+
+    return reply_from_stage(ctx, L"ONAIR", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto* layer = s.find_layer(layer_index);
+        switch (layer ? layer->attach_actions(tag, actions) : core::layer::attach_result::not_found) {
+            case core::layer::attach_result::attached:
+                return L"202 ONAIR OK\r\n";
+            case core::layer::attach_result::on_air:
+                s.run_actions(*actions);
+                return L"202 ONAIR RAN\r\n";
+            default:
+                return L"404 ONAIR FAILED\r\n";
+        }
+    });
+}
+
 void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
 {
     repo->register_channel_command(L"Basic Commands", L"LOADBG", loadbg_command, 1);
@@ -2071,6 +2219,7 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"PlayOut Commands", L"QUEUE CLEAR", queue_clear_command, 0);
     repo->register_channel_command(L"PlayOut Commands", L"QUEUE REMOVE", queue_remove_command, 1);
     repo->register_channel_command(L"PlayOut Commands", L"QUEUE INFO", queue_info_command, 0);
+    repo->register_channel_command(L"PlayOut Commands", L"ONAIR", onair_command, 2);
     repo->register_channel_command(L"PlayOut Commands", L"EVENTS", events_command, 0);
 
     repo->register_command(L"Query Commands", L"OSC SUBSCRIBE", osc_subscribe_command, 1);

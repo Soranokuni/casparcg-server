@@ -44,6 +44,16 @@ struct queued_item
     item_info                       info;
 };
 
+void merge_actions(item_info& info, const std::shared_ptr<item_actions>& actions)
+{
+    if (!info.actions) {
+        info.actions = std::make_shared<item_actions>();
+    }
+    auto& dst = *info.actions;
+    dst.stage_ops.insert(dst.stage_ops.end(), actions->stage_ops.begin(), actions->stage_ops.end());
+    dst.deferred.insert(dst.deferred.end(), actions->deferred.begin(), actions->deferred.end());
+}
+
 } // namespace
 
 struct layer::impl
@@ -64,6 +74,7 @@ struct layer::impl
     bool                                       ended_reported_  = false;
     std::int64_t                               frames_left_     = 0;
     std::vector<layer_event>                   events_;
+    std::vector<std::shared_ptr<item_actions>> pending_actions_;
 
     // A new foreground goes on air on the tick that shows its first frame. Until it is ready (a take
     // waits for its decoder), the transition keeps showing the old item, which stays on air.
@@ -71,6 +82,7 @@ struct layer::impl
     {
         bool                          active = false;
         std::wstring                  visible_tag; // the item still on air
+        std::shared_ptr<item_actions> actions;     // of the new foreground
         const char*                   reason = "";
     } switch_;
 
@@ -92,11 +104,12 @@ struct layer::impl
         events_.push_back(std::move(event));
     }
 
-    // Every change of the foreground goes through here, so no event is missed. The events follow
-    // in report_switch(), when the new foreground is ready.
+    // Every change of the foreground goes through here, so no event or on-air action is missed.
+    // The events and actions follow in report_switch(), when the new foreground is ready.
     void set_foreground(spl::shared_ptr<frame_producer> producer, item_info info, const char* reason)
     {
-        // An item replaced before it showed a frame never went on air: it gets no events.
+        // An item replaced before it showed a frame never went on air: it gets no events and its
+        // actions do not run.
         if (!switch_.active) {
             switch_.visible_tag = foreground_info_.tag;
         }
@@ -105,8 +118,11 @@ struct layer::impl
         foreground_info_ = std::move(info);
         ended_reported_  = false;
 
-        switch_.active = true;
-        switch_.reason = reason;
+        switch_.active  = true;
+        switch_.actions = std::move(foreground_info_.actions);
+        switch_.reason  = reason;
+
+        foreground_info_.actions = nullptr;
     }
 
     // The tag of the item the viewer sees.
@@ -119,6 +135,10 @@ struct layer::impl
 
         emit("offair", switch_.visible_tag, switch_.reason);
         emit("onair", foreground_info_.tag, switch_.reason);
+
+        if (switch_.actions) {
+            pending_actions_.push_back(std::move(switch_.actions));
+        }
         switch_ = {};
     }
 
@@ -218,7 +238,7 @@ struct layer::impl
         ended_reported_  = false;
     }
 
-    void prepare()
+    std::vector<std::shared_ptr<item_actions>> prepare()
     {
         try {
             // A finished transition hands over to its destination (was at the top of receive()).
@@ -253,6 +273,10 @@ struct layer::impl
             CASPAR_LOG_CURRENT_EXCEPTION();
             stop("error");
         }
+
+        auto actions = std::move(pending_actions_);
+        pending_actions_.clear();
+        return actions;
     }
 
     void update_state()
@@ -384,6 +408,39 @@ struct layer::impl
         return false;
     }
 
+    attach_result attach_actions(const std::wstring& tag, const std::shared_ptr<item_actions>& actions)
+    {
+        if (tag.empty())
+            return attach_result::not_found;
+
+        if (foreground_info_.tag == tag) {
+            // Not on air yet: the actions run with its first frame.
+            if (switch_.active) {
+                if (!switch_.actions) {
+                    switch_.actions = std::make_shared<item_actions>();
+                }
+                item_info holder{tag, switch_.actions};
+                merge_actions(holder, actions);
+                return attach_result::attached;
+            }
+            return attach_result::on_air;
+        }
+
+        if (background_ != frame_producer::empty() && background_info_.tag == tag) {
+            merge_actions(background_info_, actions);
+            return attach_result::attached;
+        }
+
+        for (auto& item : queue_) {
+            if (item.info.tag == tag) {
+                merge_actions(item.info, actions);
+                return attach_result::attached;
+            }
+        }
+
+        return attach_result::not_found;
+    }
+
     layer_snapshot snapshot() const
     {
         layer_snapshot result;
@@ -443,14 +500,18 @@ spl::shared_ptr<frame_producer> layer::background() const { return impl_->backgr
 bool                            layer::has_background() const { return impl_->background_ != frame_producer::empty(); }
 core::monitor::state            layer::state() const { return impl_->state_; }
 
-void                layer::prepare() { impl_->prepare(); }
-const std::wstring& layer::foreground_tag() const { return impl_->foreground_info_.tag; }
+std::vector<std::shared_ptr<item_actions>> layer::prepare() { return impl_->prepare(); }
+const std::wstring&                        layer::foreground_tag() const { return impl_->foreground_info_.tag; }
 void layer::queue_push(spl::shared_ptr<frame_producer> producer, bool auto_play, item_info info)
 {
     impl_->queue_push(std::move(producer), auto_play, std::move(info));
 }
 int                  layer::queue_clear(const std::wstring& after_tag) { return impl_->queue_clear(after_tag); }
 bool                 layer::queue_remove(const std::wstring& tag) { return impl_->queue_remove(tag); }
+layer::attach_result layer::attach_actions(const std::wstring& tag, const std::shared_ptr<item_actions>& actions)
+{
+    return impl_->attach_actions(tag, actions);
+}
 void layer::on_clear() { impl_->emit("offair", impl_->visible_tag(), "clear"); }
 std::vector<layer_event> layer::take_events()
 {

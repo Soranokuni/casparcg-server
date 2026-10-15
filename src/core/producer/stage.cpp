@@ -78,12 +78,50 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         {
         }
 
+        void load(int                                    index,
+                  const spl::shared_ptr<frame_producer>& producer,
+                  bool                                   preview,
+                  bool                                   auto_play,
+                  const item_info&                       info,
+                  bool                                   clear_queue) override
+        {
+            self.get_layer(index).load(producer, preview, auto_play, info, clear_queue);
+        }
+        void preview(int index) override { self.get_layer(index).preview(); }
+        void pause(int index) override { self.get_layer(index).pause(); }
+        void resume(int index) override { self.get_layer(index).resume(); }
+        void play(int index) override { self.get_layer(index).play(); }
+        void stop(int index) override { self.get_layer(index).stop(); }
+        void clear(int index) override { self.do_clear(index); }
+        void clear() override { self.do_clear_all(); }
+        void call(int index, const std::vector<std::wstring>& params) override
+        {
+            self.get_layer(index).foreground()->call(params);
+        }
+        void callbg(int index, const std::vector<std::wstring>& params) override
+        {
+            self.get_layer(index).background()->call(params);
+        }
+        void apply_transforms(const std::vector<stage_base::transform_tuple_t>& transforms) override
+        {
+            self.do_apply_transforms(transforms);
+        }
+        void apply_transform(int                     index,
+                             const transform_func_t& transform,
+                             unsigned int            mix_duration,
+                             const tweener&          tween) override
+        {
+            self.do_apply_transform(index, transform, mix_duration, tween);
+        }
+        void   clear_transforms(int index) override { self.tweens_.erase(index); }
+        void   clear_transforms() override { self.tweens_.clear(); }
         layer& get_layer(int index) override { return self.get_layer(index); }
         layer* find_layer(int index) override
         {
             auto it = self.layers_.find(index);
             return it == self.layers_.end() ? nullptr : &it->second;
         }
+        void run_actions(const item_actions& actions) override { self.run_actions(actions); }
         std::vector<layer_event> events(int index, std::uint64_t since) const override
         {
             std::vector<layer_event> result;
@@ -102,6 +140,14 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             auto it = self.event_logs_.find(index);
             return it == self.event_logs_.end() ? 0 : it->second.seq;
         }
+        void log_event(int index, const std::string& kind, const std::wstring& tag, const std::string& reason) override
+        {
+            layer_event event;
+            event.kind   = kind;
+            event.tag    = tag;
+            event.reason = reason;
+            self.orphan_events_[index].push_back(std::move(event));
+        }
         std::uint64_t frame() const override { return self.last_frame_; }
     };
 
@@ -117,7 +163,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
 
     // PlayOut fork
     std::map<int, layer_event_log>          event_logs_;
-    std::map<int, std::vector<layer_event>> orphan_events_; // events of cleared layers, not yet stamped
+    std::map<int, std::vector<layer_event>> orphan_events_; // not yet stamped: cleared layers, log_event()
     std::uint64_t                           last_frame_ = 0;
     sync_access                             sync_{*this};
 
@@ -174,14 +220,27 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         return it->second;
     }
 
-    // PlayOut fork: AUTO and the end of the foreground are handled before any layer is drawn.
+    // PlayOut fork: AUTO, the end of the foreground and on-air actions are handled before any layer
+    // is drawn, so the result of an on-air action shows on the item's first frame.
     void prepare_layers(std::uint64_t frame_number)
     {
+        const auto time_ms = unix_time_ms();
+
+        std::vector<std::shared_ptr<item_actions>> actions;
         for (auto& p : layers_) {
-            p.second.prepare();
+            for (auto& a : p.second.prepare()) {
+                actions.push_back(std::move(a));
+            }
         }
 
-        stamp_events(frame_number, unix_time_ms());
+        stamp_events(frame_number, time_ms);
+
+        for (const auto& a : actions) {
+            run_actions(*a);
+        }
+
+        // On-air actions change layers too (CLEAR, PLAY): their events belong to this frame.
+        stamp_events(frame_number, time_ms);
 
         last_frame_ = frame_number;
     }
@@ -217,6 +276,24 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         log.history.push_back(std::move(event));
         while (log.history.size() > max_logged_events) {
             log.history.pop_front();
+        }
+    }
+
+    void run_actions(const item_actions& actions)
+    {
+        for (const auto& op : actions.stage_ops) {
+            try {
+                op(sync_);
+            } catch (...) {
+                CASPAR_LOG_CURRENT_EXCEPTION();
+            }
+        }
+        for (const auto& work : actions.deferred) {
+            try {
+                work();
+            } catch (...) {
+                CASPAR_LOG_CURRENT_EXCEPTION();
+            }
         }
     }
 
@@ -268,6 +345,27 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         while (!layers_.empty()) {
             do_clear(layers_.begin()->first);
         }
+    }
+
+    void do_apply_transforms(const std::vector<stage::transform_tuple_t>& transforms)
+    {
+        for (auto& transform : transforms) {
+            auto& tween = tweens_[std::get<0>(transform)];
+            auto  src   = tween.fetch();
+            auto  dst   = std::get<1>(transform)(tween.dest());
+            tweens_[std::get<0>(transform)] =
+                tweened_transform(src, dst, std::get<2>(transform), std::get<3>(transform));
+        }
+    }
+
+    void do_apply_transform(int                            index,
+                            const stage::transform_func_t& transform,
+                            unsigned int                   mix_duration,
+                            const tweener&                 tween)
+    {
+        auto src       = tweens_[index].fetch();
+        auto dst       = transform(src);
+        tweens_[index] = tweened_transform(src, dst, mix_duration, tween);
     }
 
   public:
@@ -412,15 +510,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     std::future<void>
     apply_transforms(const std::vector<std::tuple<int, stage::transform_func_t, unsigned int, tweener>>& transforms)
     {
-        return executor_.begin_invoke([=] {
-            for (auto& transform : transforms) {
-                auto& tween = tweens_[std::get<0>(transform)];
-                auto  src   = tween.fetch();
-                auto  dst   = std::get<1>(transform)(tween.dest());
-                tweens_[std::get<0>(transform)] =
-                    tweened_transform(src, dst, std::get<2>(transform), std::get<3>(transform));
-            }
-        });
+        return executor_.begin_invoke([=] { do_apply_transforms(transforms); });
     }
 
     std::future<void> apply_transform(int                            index,
@@ -428,11 +518,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                                       unsigned int                   mix_duration,
                                       const tweener&                 tween)
     {
-        return executor_.begin_invoke([=] {
-            auto src       = tweens_[index].fetch();
-            auto dst       = transform(src);
-            tweens_[index] = tweened_transform(src, dst, mix_duration, tween);
-        });
+        return executor_.begin_invoke([=] { do_apply_transform(index, transform, mix_duration, tween); });
     }
 
     std::future<void> clear_transforms(int index)
@@ -806,6 +892,113 @@ std::future<std::shared_ptr<frame_producer>> stage_delayed::background(int index
 std::future<void> stage_delayed::execute(std::function<void()> func)
 {
     return executor_.begin_invoke([=]() { return stage_->execute(func).get(); });
+}
+
+// STAGE CAPTURE (PlayOut fork: ONAIR)
+std::future<void> stage_capture::record(captured_op op)
+{
+    ops_.push_back(std::move(op));
+    return make_ready_future();
+}
+std::future<void> stage_capture::apply_transforms(const std::vector<transform_tuple_t>& transforms)
+{
+    return record([=](stage_sync_ops& s) { s.apply_transforms(transforms); });
+}
+std::future<void> stage_capture::apply_transform(int                     index,
+                                                 const transform_func_t& transform,
+                                                 unsigned int            mix_duration,
+                                                 const tweener&          tween)
+{
+    return record([=](stage_sync_ops& s) { s.apply_transform(index, transform, mix_duration, tween); });
+}
+std::future<void> stage_capture::clear_transforms(int index)
+{
+    return record([=](stage_sync_ops& s) { s.clear_transforms(index); });
+}
+std::future<void> stage_capture::clear_transforms()
+{
+    return record([](stage_sync_ops& s) { s.clear_transforms(); });
+}
+std::future<frame_transform> stage_capture::get_current_transform(int index)
+{
+    return make_ready_future(frame_transform{});
+}
+std::future<void> stage_capture::load(int                                    index,
+                                      const spl::shared_ptr<frame_producer>& producer,
+                                      bool                                   preview,
+                                      bool                                   auto_play,
+                                      item_info                              info,
+                                      bool                                   clear_queue)
+{
+    return record([=](stage_sync_ops& s) { s.load(index, producer, preview, auto_play, info, clear_queue); });
+}
+std::future<void> stage_capture::preview(int index)
+{
+    return record([=](stage_sync_ops& s) { s.preview(index); });
+}
+std::future<void> stage_capture::pause(int index)
+{
+    return record([=](stage_sync_ops& s) { s.pause(index); });
+}
+std::future<void> stage_capture::resume(int index)
+{
+    return record([=](stage_sync_ops& s) { s.resume(index); });
+}
+std::future<void> stage_capture::play(int index)
+{
+    return record([=](stage_sync_ops& s) { s.play(index); });
+}
+std::future<void> stage_capture::stop(int index)
+{
+    return record([=](stage_sync_ops& s) { s.stop(index); });
+}
+std::future<std::wstring> stage_capture::call(int index, const std::vector<std::wstring>& params)
+{
+    record([=](stage_sync_ops& s) { s.call(index, params); });
+    return make_ready_future(std::wstring());
+}
+std::future<std::wstring> stage_capture::callbg(int index, const std::vector<std::wstring>& params)
+{
+    record([=](stage_sync_ops& s) { s.callbg(index, params); });
+    return make_ready_future(std::wstring());
+}
+std::future<void> stage_capture::clear(int index)
+{
+    return record([=](stage_sync_ops& s) { s.clear(index); });
+}
+std::future<void> stage_capture::clear()
+{
+    return record([](stage_sync_ops& s) { s.clear(); });
+}
+std::future<void> stage_capture::swap_layers(const std::shared_ptr<stage_base>& other, bool swap_transforms)
+{
+    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"SWAP is not supported in ONAIR."));
+}
+std::future<void> stage_capture::swap_layer(int index, int other_index, bool swap_transforms)
+{
+    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"SWAP is not supported in ONAIR."));
+}
+std::future<void>
+stage_capture::swap_layer(int index, int other_index, const std::shared_ptr<stage_base>& other, bool swap_transforms)
+{
+    CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"SWAP is not supported in ONAIR."));
+}
+std::future<std::shared_ptr<frame_producer>> stage_capture::foreground(int index)
+{
+    return make_ready_future(std::shared_ptr<frame_producer>());
+}
+std::future<std::shared_ptr<frame_producer>> stage_capture::background(int index)
+{
+    return make_ready_future(std::shared_ptr<frame_producer>());
+}
+std::future<void> stage_capture::execute(std::function<void()> func)
+{
+    func();
+    return make_ready_future();
+}
+std::future<void> stage_capture::invoke_sync(std::function<void(stage_sync_ops&)> func)
+{
+    return record(std::move(func));
 }
 
 }} // namespace caspar::core

@@ -57,6 +57,8 @@ class AMCPCommand
 
     int channel_index() const { return ctx_.channel_index; }
 
+    int layer_index() const { return ctx_.layer_id; }
+
     IO::ClientInfoPtr client() const { return ctx_.client; }
 
     const std::wstring& name() const { return name_; }

@@ -25,7 +25,9 @@
 #include "amcp_command_repository.h"
 #include "amcp_shared.h"
 #include <accelerator/accelerator.h>
+#include <common/executor.h>
 #include <future>
+#include <memory>
 #include <utility>
 
 namespace caspar::protocol::osc {
@@ -46,6 +48,9 @@ struct amcp_command_static_context
     const std::string                                          proxy_port;
     std::weak_ptr<accelerator::accelerator_device>             ogl_device;
     const spl::shared_ptr<osc::client>                         osc_client;
+
+    // PlayOut fork: runs the CG commands of ONAIR actions, off the channel thread.
+    const std::shared_ptr<executor> onair_executor = std::make_shared<executor>(L"onair actions");
 
     amcp_command_static_context(core::video_format_repository                               format_repository,
                                 const spl::shared_ptr<core::cg_producer_registry>&          cg_registry,
