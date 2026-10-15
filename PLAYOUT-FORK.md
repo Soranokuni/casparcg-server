@@ -5,6 +5,9 @@ outside: which item is on air, a queue of next items, actions that run on the ex
 goes on air, an emergency fallback, and a reliable event log. Without these, PlayOut has to guess
 the engine state from OSC file paths and positions. Everything else stays stock 2.5.1.
 
+- Repository: <https://github.com/Soranokuni/casparcg-server>, a GitHub fork of CasparCG/server,
+  branch `playout/2.5.1`. Nothing goes to the official repository: in the local clone, remote
+  `origin` (CasparCG/server) is fetch-only (push URL `no-push`), and remote `fork` is this repository.
 - Base: `v2.5.1-stable` (`ec38d944`), branch `playout/2.5.1`.
 - `43a7ffee` — build with Boost 1.83 (needed to run on the Windows-on-ARM development laptop).
 - This change set: TAG, QUEUE, ONAIR, FALLBACK/STALL, EVENTS, a fix for an upstream bug (§7) and a
