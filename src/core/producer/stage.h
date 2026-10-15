@@ -23,6 +23,7 @@
 
 #include "../fwd.h"
 #include "../monitor/monitor.h"
+#include "layer_item.h"
 
 #include <common/executor.h>
 #include <common/memory.h>
@@ -43,6 +44,8 @@ class graph;
 }
 
 namespace caspar { namespace core {
+
+class layer;
 
 struct layer_frame
 {
@@ -80,8 +83,11 @@ class stage_base
     virtual std::future<void>            clear_transforms(int index)                                               = 0;
     virtual std::future<void>            clear_transforms()                                                        = 0;
     virtual std::future<frame_transform> get_current_transform(int index)                                          = 0;
-    virtual std::future<void>
-    load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview = false, bool auto_play = false) = 0;
+    virtual std::future<void>            load(int                                    index,
+                                              const spl::shared_ptr<frame_producer>& producer,
+                                              bool                                   preview   = false,
+                                              bool                                   auto_play = false,
+                                              item_info                              info      = {})       = 0;
     virtual std::future<void>         preview(int index)                                                           = 0;
     virtual std::future<void>         pause(int index)                                                             = 0;
     virtual std::future<void>         resume(int index)                                                            = 0;
@@ -98,9 +104,34 @@ class stage_base
 
     virtual std::future<void> execute(std::function<void()> k) = 0;
 
+    // PlayOut fork: runs func on the stage thread, between two ticks.
+    virtual std::future<void> invoke_sync(std::function<void(stage_sync_ops&)> func) = 0;
+
     // Properties
     virtual std::future<std::shared_ptr<frame_producer>> foreground(int index) = 0;
     virtual std::future<std::shared_ptr<frame_producer>> background(int index) = 0;
+};
+
+/**
+ * PlayOut fork: synchronous access to a stage. Only valid on the stage thread, that is inside
+ * stage_base::invoke_sync.
+ */
+class stage_sync_ops
+{
+  public:
+    virtual ~stage_sync_ops() {}
+
+    // The layer at index, created when it does not exist.
+    virtual layer& get_layer(int index) = 0;
+    // The layer at index, or nullptr.
+    virtual layer* find_layer(int index) = 0;
+
+    // The layer's event log: events with seq > since, oldest first.
+    virtual std::vector<layer_event> events(int index, std::uint64_t since) const = 0;
+    virtual std::uint64_t            last_event_seq(int index) const               = 0;
+
+    // Channel frame counter of the last tick.
+    virtual std::uint64_t frame() const = 0;
 };
 
 /**
@@ -131,7 +162,8 @@ class stage final : public stage_base
     std::future<void>            load(int                                    index,
                                       const spl::shared_ptr<frame_producer>& producer,
                                       bool                                   preview   = false,
-                                      bool                                   auto_play = false) override;
+                                      bool                                   auto_play = false,
+                                      item_info                              info      = {}) override;
     std::future<void>            preview(int index) override;
     std::future<void>            pause(int index) override;
     std::future<void>            resume(int index) override;
@@ -152,6 +184,7 @@ class stage final : public stage_base
     std::future<std::shared_ptr<frame_producer>> background(int index) override;
 
     std::future<void>            execute(std::function<void()> k) override;
+    std::future<void>            invoke_sync(std::function<void(stage_sync_ops&)> func) override;
     std::unique_lock<std::mutex> get_lock() const;
 
     core::video_format_desc video_format_desc() const;
@@ -187,7 +220,8 @@ class stage_delayed final : public stage_base
     std::future<void>            load(int                                    index,
                                       const spl::shared_ptr<frame_producer>& producer,
                                       bool                                   preview   = false,
-                                      bool                                   auto_play = false) override;
+                                      bool                                   auto_play = false,
+                                      item_info                              info      = {}) override;
     std::future<void>            preview(int index) override;
     std::future<void>            pause(int index) override;
     std::future<void>            resume(int index) override;
@@ -208,6 +242,7 @@ class stage_delayed final : public stage_base
     std::future<std::shared_ptr<frame_producer>> background(int index) override;
 
     std::future<void>            execute(std::function<void()> k) override;
+    std::future<void>            invoke_sync(std::function<void(stage_sync_ops&)> func) override;
     std::unique_lock<std::mutex> get_lock() const { return stage_->get_lock(); }
 
   private:

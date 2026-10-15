@@ -30,12 +30,15 @@
 #include <common/diagnostics/graph.h>
 #include <common/executor.h>
 #include <common/future.h>
+#include <common/utf.h>
 
 #include <core/frame/frame_transform.h>
 #include <core/producer/route/route_producer.h>
 
 #include <boost/range/adaptors.hpp>
 
+#include <chrono>
+#include <deque>
 #include <functional>
 #include <future>
 #include <map>
@@ -43,8 +46,65 @@
 
 namespace caspar { namespace core {
 
+namespace {
+
+// PlayOut fork: the event log of a layer index. It outlives the layer (CLEAR).
+struct layer_event_log
+{
+    std::uint64_t           seq = 0;
+    std::deque<layer_event> history;
+};
+
+const std::size_t max_logged_events = 128;
+
+std::int64_t unix_time_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
 struct stage::impl : public std::enable_shared_from_this<impl>
 {
+    // PlayOut fork: stage_sync_ops for code that already runs on the stage thread.
+    struct sync_access final : public stage_sync_ops
+    {
+        impl& self;
+
+        explicit sync_access(impl& s)
+            : self(s)
+        {
+        }
+
+        layer& get_layer(int index) override { return self.get_layer(index); }
+        layer* find_layer(int index) override
+        {
+            auto it = self.layers_.find(index);
+            return it == self.layers_.end() ? nullptr : &it->second;
+        }
+        std::vector<layer_event> events(int index, std::uint64_t since) const override
+        {
+            std::vector<layer_event> result;
+            auto                     it = self.event_logs_.find(index);
+            if (it != self.event_logs_.end()) {
+                for (const auto& event : it->second.history) {
+                    if (event.seq > since) {
+                        result.push_back(event);
+                    }
+                }
+            }
+            return result;
+        }
+        std::uint64_t last_event_seq(int index) const override
+        {
+            auto it = self.event_logs_.find(index);
+            return it == self.event_logs_.end() ? 0 : it->second.seq;
+        }
+        std::uint64_t frame() const override { return self.last_frame_; }
+    };
+
     int                                 channel_index_;
     spl::shared_ptr<diagnostics::graph> graph_;
     monitor::state                      state_;
@@ -54,6 +114,12 @@ struct stage::impl : public std::enable_shared_from_this<impl>
 
     mutable std::mutex      format_desc_mutex_;
     core::video_format_desc format_desc_;
+
+    // PlayOut fork
+    std::map<int, layer_event_log>          event_logs_;
+    std::map<int, std::vector<layer_event>> orphan_events_; // events of cleared layers, not yet stamped
+    std::uint64_t                           last_frame_ = 0;
+    sync_access                             sync_{*this};
 
     executor   executor_{L"stage " + std::to_wstring(channel_index_)};
     std::mutex lock_;
@@ -108,6 +174,102 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         return it->second;
     }
 
+    // PlayOut fork: AUTO and the end of the foreground are handled before any layer is drawn.
+    void prepare_layers(std::uint64_t frame_number)
+    {
+        for (auto& p : layers_) {
+            p.second.prepare();
+        }
+
+        stamp_events(frame_number, unix_time_ms());
+
+        last_frame_ = frame_number;
+    }
+
+    void stamp_events(std::uint64_t frame_number, std::int64_t time_ms)
+    {
+        // Cleared layers first: they went before anything on a new layer at the same index.
+        for (auto& p : orphan_events_) {
+            for (auto& event : p.second) {
+                log_event(p.first, std::move(event), frame_number, time_ms);
+            }
+        }
+        orphan_events_.clear();
+
+        for (auto& p : layers_) {
+            for (auto& event : p.second.take_events()) {
+                log_event(p.first, std::move(event), frame_number, time_ms);
+            }
+        }
+    }
+
+    void log_event(int index, layer_event event, std::uint64_t frame_number, std::int64_t time_ms)
+    {
+        auto& log     = event_logs_[index];
+        event.seq     = ++log.seq;
+        event.frame   = static_cast<std::int64_t>(frame_number);
+        event.time_ms = time_ms;
+
+        CASPAR_LOG(info) << L"[event] " << channel_index_ << L"-" << index << L" #" << event.seq << L" "
+                         << u16(event.kind) << L" " << event.tag << L" (" << u16(event.reason) << L") frame "
+                         << event.frame;
+
+        log.history.push_back(std::move(event));
+        while (log.history.size() > max_logged_events) {
+            log.history.pop_front();
+        }
+    }
+
+    // The latest event of each kind stays in the OSC state, so a lost or coalesced packet loses nothing.
+    void add_event_state(monitor::state& state, std::uint64_t frame_number) const
+    {
+        static const char* const kinds[] = {"onair", "offair", "ended", "stalled", "actionfailed"};
+
+        state["frame"] = static_cast<std::int64_t>(frame_number);
+
+        for (const auto& p : event_logs_) {
+            const auto& log = p.second;
+            if (log.history.empty()) {
+                continue;
+            }
+
+            state["layer"][p.first]["event"]["seq"] = static_cast<std::int64_t>(log.seq);
+            for (const auto* kind : kinds) {
+                for (auto it = log.history.rbegin(); it != log.history.rend(); ++it) {
+                    if (it->kind == kind) {
+                        state["layer"][p.first]["event"][kind] = {
+                            static_cast<std::int64_t>(it->seq), it->frame, it->time_ms, it->tag, it->reason};
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    void do_clear(int index)
+    {
+        auto it = layers_.find(index);
+        if (it == layers_.end()) {
+            return;
+        }
+
+        // PlayOut fork: the layer's events go to the log, which outlives the layer.
+        it->second.on_clear();
+        auto& orphans = orphan_events_[index];
+        for (auto& event : it->second.take_events()) {
+            orphans.push_back(std::move(event));
+        }
+
+        layers_.erase(it);
+    }
+
+    void do_clear_all()
+    {
+        while (!layers_.empty()) {
+            do_clear(layers_.begin()->first);
+        }
+    }
+
   public:
     impl(int channel_index, spl::shared_ptr<diagnostics::graph> graph, const core::video_format_desc& format_desc)
         : channel_index_(channel_index)
@@ -132,6 +294,8 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             auto field1        = is_interlaced ? video_field::a : video_field::progressive;
 
             try {
+                prepare_layers(frame_number);
+
                 for (auto& t : tweens_)
                     t.second.tick(1);
 
@@ -220,10 +384,15 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                 for (auto& p : layers_) {
                     state["layer"][p.first] = p.second.state();
                 }
+                add_event_state(state, frame_number);
                 state_ = std::move(state);
             } catch (...) {
-                layers_.clear();
                 CASPAR_LOG_CURRENT_EXCEPTION();
+                try {
+                    do_clear_all();
+                } catch (...) {
+                    layers_.clear();
+                }
             }
 
             return result;
@@ -281,9 +450,15 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         return executor_.begin_invoke([=] { return tweens_[index].fetch(); });
     }
 
-    std::future<void> load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play)
+    std::future<void>
+    load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play, const item_info& info)
     {
-        return executor_.begin_invoke([=] { get_layer(index).load(producer, preview, auto_play); });
+        return executor_.begin_invoke([=] { get_layer(index).load(producer, preview, auto_play, info); });
+    }
+
+    std::future<void> invoke_sync(std::function<void(stage_sync_ops&)> func)
+    {
+        return executor_.begin_invoke([=] { func(sync_); });
     }
 
     std::future<void> preview(int index)
@@ -313,12 +488,12 @@ struct stage::impl : public std::enable_shared_from_this<impl>
 
     std::future<void> clear(int index)
     {
-        return executor_.begin_invoke([=] { layers_.erase(index); });
+        return executor_.begin_invoke([=] { do_clear(index); });
     }
 
     std::future<void> clear()
     {
-        return executor_.begin_invoke([=] { layers_.clear(); });
+        return executor_.begin_invoke([=] { do_clear_all(); });
     }
 
     std::future<void> swap_layers(const std::shared_ptr<stage>& other, bool swap_transforms)
@@ -422,7 +597,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                 format_desc_ = format_desc;
             }
 
-            layers_.clear();
+            do_clear_all();
         });
     }
 };
@@ -453,9 +628,14 @@ std::future<void> stage::apply_transform(int                                    
 std::future<void>            stage::clear_transforms(int index) { return impl_->clear_transforms(index); }
 std::future<void>            stage::clear_transforms() { return impl_->clear_transforms(); }
 std::future<frame_transform> stage::get_current_transform(int index) { return impl_->get_current_transform(index); }
-std::future<void> stage::load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play)
+std::future<void>
+stage::load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play, item_info info)
 {
-    return impl_->load(index, producer, preview, auto_play);
+    return impl_->load(index, producer, preview, auto_play, info);
+}
+std::future<void> stage::invoke_sync(std::function<void(stage_sync_ops&)> func)
+{
+    return impl_->invoke_sync(std::move(func));
 }
 std::future<void> stage::preview(int index) { return impl_->preview(index); }
 std::future<void> stage::pause(int index) { return impl_->pause(index); }
@@ -542,10 +722,17 @@ std::future<frame_transform> stage_delayed::get_current_transform(int index)
 {
     return executor_.begin_invoke([=]() { return stage_->get_current_transform(index).get(); });
 }
-std::future<void>
-stage_delayed::load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play)
+std::future<void> stage_delayed::load(int                                    index,
+                                      const spl::shared_ptr<frame_producer>& producer,
+                                      bool                                   preview,
+                                      bool                                   auto_play,
+                                      item_info                              info)
 {
-    return executor_.begin_invoke([=]() { return stage_->load(index, producer, preview, auto_play).get(); });
+    return executor_.begin_invoke([=]() { return stage_->load(index, producer, preview, auto_play, info).get(); });
+}
+std::future<void> stage_delayed::invoke_sync(std::function<void(stage_sync_ops&)> func)
+{
+    return executor_.begin_invoke([=]() { return stage_->invoke_sync(func).get(); });
 }
 std::future<void> stage_delayed::preview(int index)
 {

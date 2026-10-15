@@ -68,6 +68,7 @@ set(HEADERS
 		producer/frame_producer.h
 		producer/frame_producer_registry.h
 		producer/layer.h
+		producer/layer_item.h
 		producer/stage.h
 
 		fwd.h

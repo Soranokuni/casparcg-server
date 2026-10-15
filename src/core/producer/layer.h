@@ -22,11 +22,14 @@
 #pragma once
 
 #include "frame_producer.h"
+#include "layer_item.h"
 
 #include "../fwd.h"
 #include "../monitor/monitor.h"
 
 #include <common/memory.h>
+
+#include <vector>
 
 namespace caspar { namespace core {
 
@@ -43,12 +46,19 @@ class layer final
 
     void swap(layer& other);
 
-    void load(spl::shared_ptr<frame_producer> producer, bool preview, bool auto_play = false);
+    void load(spl::shared_ptr<frame_producer> producer,
+              bool                            preview,
+              bool                            auto_play = false,
+              item_info                       info      = {});
     void play();
     void preview();
     void pause();
     void resume();
     void stop();
+
+    // PlayOut fork: runs once per tick, before receive(). Promotes an AUTO background and reports
+    // the end of the foreground.
+    void prepare();
 
     draw_frame receive(const video_field field, int nb_samples);
     draw_frame receive_background(const video_field field, int nb_samples);
@@ -58,6 +68,10 @@ class layer final
     spl::shared_ptr<frame_producer> foreground() const;
     spl::shared_ptr<frame_producer> background() const;
     bool                            has_background() const;
+
+    // PlayOut fork: item tags and the event log.
+    void                     on_clear();
+    std::vector<layer_event> take_events();
 
   private:
     struct impl;

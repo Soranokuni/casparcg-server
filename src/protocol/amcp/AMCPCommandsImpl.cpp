@@ -28,6 +28,7 @@
 #include "AMCPCommandsImpl.h"
 
 #include "../util/http_request.h"
+#include "AMCPCommand.h"
 #include "AMCPCommandQueue.h"
 #include "amcp_args.h"
 
@@ -59,9 +60,12 @@
 #include <protocol/osc/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <future>
 #include <memory>
+#include <optional>
+#include <sstream>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/regex.hpp>
@@ -271,7 +275,131 @@ bool try_match_sting(const std::vector<std::wstring>& params, sting_info& stingI
     return true;
 }
 
+// PlayOut fork: helpers for TAG and the JSON replies. See PLAYOUT-FORK.md.
+
+const std::int64_t server_instance =
+    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+
+// Takes "NAME value" out of params and returns the value. The search starts at first, so the clip
+// name in params[0] is never taken for a parameter.
+std::optional<std::wstring> take_param(const std::wstring& name, std::vector<std::wstring>& params, std::size_t first)
+{
+    if (params.size() <= first)
+        return {};
+
+    auto it = std::find_if(params.begin() + first, params.end(), param_comparer(name));
+    if (it == params.end())
+        return {};
+
+    if (std::next(it) == params.end())
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(name + L" needs a value."));
+
+    auto value = *std::next(it);
+    params.erase(it, std::next(it, 2));
+    return value;
+}
+
+// Tags go into OSC strings and line-based replies, so they are kept to a safe set of characters.
+const std::wstring& check_tag(const std::wstring& tag)
+{
+    const bool valid = !tag.empty() && tag.size() <= 128 && std::all_of(tag.begin(), tag.end(), [](wchar_t c) {
+                           return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                                  c == L'-' || c == L'_' || c == L'.' || c == L':';
+                       });
+    if (!valid)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid tag: " + tag));
+
+    return tag;
+}
+
+std::wstring take_tag(std::vector<std::wstring>& params, std::size_t first)
+{
+    auto tag = take_param(L"TAG", params, first);
+    return tag ? check_tag(*tag) : L"";
+}
+
+std::wstring json_string(const std::wstring& value)
+{
+    std::wstring result = L"\"";
+    for (auto c : value) {
+        switch (c) {
+            case L'"':
+                result += L"\\\"";
+                break;
+            case L'\\':
+                result += L"\\\\";
+                break;
+            case L'\n':
+                result += L"\\n";
+                break;
+            case L'\r':
+                result += L"\\r";
+                break;
+            case L'\t':
+                result += L"\\t";
+                break;
+            default:
+                if (c < 0x20) {
+                    wchar_t escaped[8];
+                    swprintf(escaped, 8, L"\\u%04x", static_cast<unsigned int>(c));
+                    result += escaped;
+                } else {
+                    result += c;
+                }
+        }
+    }
+    return result + L"\"";
+}
+
+// Runs func on the stage thread, between two ticks, and replies with its result.
+std::future<std::wstring> reply_from_stage(command_context&                                        ctx,
+                                           const std::wstring&                                     name,
+                                           std::function<std::wstring(core::stage_sync_ops&)> func)
+{
+    auto reply  = std::make_shared<std::promise<std::wstring>>();
+    auto result = reply->get_future();
+
+    ctx.channel.stage->invoke_sync([reply, name, func](core::stage_sync_ops& s) {
+        try {
+            reply->set_value(func(s));
+        } catch (...) {
+            CASPAR_LOG_CURRENT_EXCEPTION();
+            reply->set_value(L"501 " + name + L" FAILED\r\n");
+        }
+    });
+
+    return result;
+}
+
 // Basic Commands
+
+// The producer for LOADBG and PLAY, wrapped in its transition or sting.
+spl::shared_ptr<frame_producer> create_background_producer(command_context& ctx)
+{
+    auto channel = ctx.channel.raw_channel;
+
+    auto new_producer = ctx.static_context->producer_registry->create_producer(
+        get_producer_dependencies(channel, ctx), ctx.parameters);
+
+    if (new_producer == frame_producer::empty())
+        CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(!ctx.parameters.empty() ? ctx.parameters[0] : L""));
+
+    sting_info stingInfo;
+    if (try_match_sting(ctx.parameters, stingInfo)) {
+        return create_sting_producer(get_producer_dependencies(channel, ctx), new_producer, stingInfo);
+    }
+
+    std::wstring message;
+    for (std::wstring& parameter : ctx.parameters) {
+        message += boost::to_upper_copy(parameter) + L" ";
+    }
+
+    // Try other transitions
+    transition_info transitionInfo;
+    try_match_transition(message, transitionInfo);
+    return create_transition_producer(new_producer, transitionInfo);
+}
 
 std::wstring loadbg_command(command_context& ctx)
 {
@@ -280,37 +408,16 @@ std::wstring loadbg_command(command_context& ctx)
     core::diagnostics::call_context::for_thread().video_channel = ctx.channel_index + 1;
     core::diagnostics::call_context::for_thread().layer         = ctx.layer_index();
 
-    auto channel   = ctx.channel.raw_channel;
-    bool auto_play = contains_param(L"AUTO", ctx.parameters);
+    auto                  channel = ctx.channel.raw_channel;
+    const core::item_info info{take_tag(ctx.parameters, 1)};
+    bool                  auto_play = contains_param(L"AUTO", ctx.parameters);
 
     try {
-        auto new_producer = ctx.static_context->producer_registry->create_producer(
-            get_producer_dependencies(channel, ctx), ctx.parameters);
-
-        if (new_producer == frame_producer::empty())
-            CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(!ctx.parameters.empty() ? ctx.parameters[0] : L""));
-
-        spl::shared_ptr<frame_producer> transition_producer = frame_producer::empty();
-        transition_info                 transitionInfo;
-        sting_info                      stingInfo;
-
-        if (try_match_sting(ctx.parameters, stingInfo)) {
-            transition_producer =
-                create_sting_producer(get_producer_dependencies(channel, ctx), new_producer, stingInfo);
-        } else {
-            std::wstring message;
-            for (std::wstring& parameter : ctx.parameters) {
-                message += boost::to_upper_copy(parameter) + L" ";
-            }
-
-            // Try other transitions
-            try_match_transition(message, transitionInfo);
-            transition_producer = create_transition_producer(new_producer, transitionInfo);
-        }
+        auto transition_producer = create_background_producer(ctx);
 
         // TODO - we should pass the format into load(), so that we can catch it having changed since the producer was
         // initialised
-        ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play); // TODO: LOOP
+        ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play, info); // TODO: LOOP
     } catch (file_not_found&) {
         if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
             ctx.channel.stage->load(
@@ -332,12 +439,13 @@ std::wstring load_command(command_context& ctx)
         // Must be a promoting load
         ctx.channel.stage->preview(ctx.layer_index());
     } else {
+        const core::item_info info{take_tag(ctx.parameters, 1)};
         try {
             auto new_producer = ctx.static_context->producer_registry->create_producer(
                 get_producer_dependencies(ctx.channel.raw_channel, ctx), ctx.parameters);
             auto transition_producer = create_transition_producer(new_producer, transition_info{});
 
-            ctx.channel.stage->load(ctx.layer_index(), transition_producer, true);
+            ctx.channel.stage->load(ctx.layer_index(), transition_producer, true, false, info);
         } catch (file_not_found&) {
             if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
                 ctx.channel.stage->load(
@@ -1714,6 +1822,41 @@ std::wstring osc_unsubscribe_command(command_context& ctx)
     return L"202 OSC UNSUBSCRIBE OK\r\n";
 }
 
+// PlayOut fork: EVENTS. See PLAYOUT-FORK.md.
+
+// EVENTS 1-10 [<seq>]: the layer's events after <seq>, oldest first, as one line of JSON.
+std::future<std::wstring> events_command(command_context& ctx)
+{
+    const std::uint64_t since   = ctx.parameters.empty() ? 0 : boost::lexical_cast<std::uint64_t>(ctx.parameters.at(0));
+    const int           channel = ctx.channel_index + 1;
+    const int           index   = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"EVENTS", [=](core::stage_sync_ops& s) -> std::wstring {
+        const auto all    = s.events(index, 0);
+        const auto oldest = all.empty() ? 0 : all.front().seq;
+
+        std::wstringstream json;
+        json << L"{\"channel\":" << channel << L",\"layer\":" << index << L",\"instance\":" << server_instance
+             << L",\"frame\":" << s.frame() << L",\"last\":" << s.last_event_seq(index) << L",\"oldest\":" << oldest
+             << L",\"events\":[";
+
+        bool first = true;
+        for (const auto& event : all) {
+            if (event.seq <= since)
+                continue;
+
+            json << (first ? L"" : L",") << L"{\"seq\":" << event.seq << L",\"frame\":" << event.frame
+                 << L",\"time\":" << event.time_ms << L",\"kind\":" << json_string(u16(event.kind))
+                 << L",\"tag\":" << json_string(event.tag) << L",\"reason\":" << json_string(u16(event.reason))
+                 << L"}";
+            first = false;
+        }
+        json << L"]}";
+
+        return L"201 EVENTS OK\r\n" + json.str() + L"\r\n";
+    });
+}
+
 void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
 {
     repo->register_channel_command(L"Basic Commands", L"LOADBG", loadbg_command, 1);
@@ -1790,6 +1933,9 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_command(L"Query Commands", L"INFO PATHS", info_paths_command, 0);
     repo->register_command(L"Query Commands", L"GL INFO", gl_info_command, 0);
     repo->register_command(L"Query Commands", L"GL GC", gl_gc_command, 0);
+
+    // PlayOut fork
+    repo->register_channel_command(L"PlayOut Commands", L"EVENTS", events_command, 0);
 
     repo->register_command(L"Query Commands", L"OSC SUBSCRIBE", osc_subscribe_command, 1);
     repo->register_command(L"Query Commands", L"OSC UNSUBSCRIBE", osc_unsubscribe_command, 1);
