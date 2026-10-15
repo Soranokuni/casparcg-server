@@ -52,21 +52,21 @@ casparcg_add_runtime_dependency("${PROJECT_SOURCE_DIR}/shell/casparcg.config")
 casparcg_add_external_project(boost)
 if (BOOST_USE_PRECOMPILED)
 	ExternalProject_Add(boost
-	URL ${CASPARCG_DOWNLOAD_MIRROR}/boost/boost_1_74_0-win32-x64-debug-release.zip
-	URL_HASH MD5=8d379b0da9a5ae50a3980d2fc1a24d34
+	URL ${CASPARCG_DOWNLOAD_MIRROR}/boost/boost_1_83_0-win32-x64-debug-release.zip
+	URL_HASH MD5=0b9990a24259867c8c04ae30c423f86b
 	DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
 	CONFIGURE_COMMAND ""
 	BUILD_COMMAND ""
 	INSTALL_COMMAND ""
 	)
 	ExternalProject_Get_Property(boost SOURCE_DIR)
-	set(BOOST_INCLUDE_PATH "${SOURCE_DIR}/include/boost-1_74")
+	set(BOOST_INCLUDE_PATH "${SOURCE_DIR}/include/boost-1_83")
 	link_directories("${SOURCE_DIR}/lib")
 else ()
 	set(BOOST_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/boost-install)
 	ExternalProject_Add(boost
-	URL ${CASPARCG_DOWNLOAD_MIRROR}/boost/boost_1_74_0.zip
-	URL_HASH MD5=df1456965493f05952b7c06205688ae9
+	URL ${CASPARCG_DOWNLOAD_MIRROR}/boost/boost_1_83_0.zip
+	URL_HASH MD5=03d5aea72401ffed848cb5daf8cd2b9b
 	DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
 	BUILD_IN_SOURCE 1
 	CONFIGURE_COMMAND ./bootstrap.bat
@@ -80,7 +80,7 @@ else ()
 	BUILD_COMMAND ./b2 install debug release --prefix=${BOOST_INSTALL_DIR} link=static threading=multi runtime-link=shared -j ${CONFIG_CPU_COUNT}
 	INSTALL_COMMAND ""
 	)
-	set(BOOST_INCLUDE_PATH "${BOOST_INSTALL_DIR}/include/boost-1_74")
+	set(BOOST_INCLUDE_PATH "${BOOST_INSTALL_DIR}/include/boost-1_83")
 	link_directories("${BOOST_INSTALL_DIR}/lib")
 endif ()
 add_definitions( -DBOOST_CONFIG_SUPPRESS_OUTDATED_MESSAGE )
