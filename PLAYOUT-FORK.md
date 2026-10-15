@@ -9,6 +9,7 @@ the engine state from OSC file paths and positions. Everything else stays stock 
 - `43a7ffee` — build with Boost 1.83 (needed to run on the Windows-on-ARM development laptop).
 - This change set: TAG, QUEUE, ONAIR, FALLBACK/STALL, EVENTS, a fix for an upstream bug (§7) and a
   console input fix (§6).
+- `520596b2` — merge of `origin/v2.5.x`: upstream's fixes after v2.5.1.
 - Target: x64 broadcast PCs. Development and build: Windows 11 on ARM64 (see §2).
 
 Contents
@@ -564,9 +565,10 @@ Notes:
 - **Tags must be unique per layer** for exact results (§3.1).
 - **Long soak test not done.** The 165 checks run for about two minutes. Each queued item holds an
   open decoder, and the engine does not limit the queue depth yet.
-- **Not merged: `origin/v2.5.x`.** It has 8 fixes after v2.5.1 (CEF crashes, the channel monitor
-  snapshot race, DeckLink v210 colours, and others) and touches none of the fork's files. Merge it
-  and run the tests again before the fork goes to the broadcast PC.
+- **Upstream fixes after v2.5.1 are merged** (`origin/v2.5.x`, merge `520596b2`: CEF crashes, the
+  channel monitor snapshot race, DeckLink v210 colours and others). They touch none of the fork's
+  files. After the merge the build is clean and all 165 checks pass. Merge `origin/v2.5.x` again
+  when upstream adds fixes, and re-run the tests.
 
 ---
 
