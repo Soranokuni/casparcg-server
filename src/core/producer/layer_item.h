@@ -17,16 +17,21 @@
  * along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
  */
 
-// PlayOut fork: item identity (TAG), on-air actions (ONAIR), the wait queue (QUEUE) and the layer
-// event log (EVENTS). See PLAYOUT-FORK.md in the repository root.
+// PlayOut fork: item identity (TAG), on-air actions (ONAIR), the wait queue (QUEUE), the fallback
+// (FALLBACK) and the layer event log (EVENTS). See PLAYOUT-FORK.md in the repository root.
 
 #pragma once
+
+#include "frame_producer.h"
+
+#include <common/memory.h>
 
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace caspar { namespace core {
@@ -53,6 +58,14 @@ struct item_info
 {
     std::wstring                  tag;
     std::shared_ptr<item_actions> actions;
+};
+
+// Fallback configuration of a layer index. Kept by the stage, so it survives CLEAR.
+struct fallback_config
+{
+    spl::shared_ptr<frame_producer> producer = frame_producer::empty();
+    std::wstring                    tag;
+    int                             stall_limit = 0; // frames without a new frame before failover; 0 = off
 };
 
 // One entry in a layer's event log.
@@ -84,6 +97,7 @@ struct layer_snapshot
     bool                      paused       = false;
     bool                      starting     = false; // the foreground has not shown its first frame yet
     std::vector<waiting_item> waiting;              // the background first, then the queue
+    bool                      fallback_active = false;
 };
 
 }} // namespace caspar::core

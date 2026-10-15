@@ -1849,7 +1849,7 @@ std::wstring osc_unsubscribe_command(command_context& ctx)
     return L"202 OSC UNSUBSCRIBE OK\r\n";
 }
 
-// PlayOut fork: QUEUE, ONAIR and EVENTS. See PLAYOUT-FORK.md.
+// PlayOut fork: QUEUE, ONAIR, FALLBACK and EVENTS. See PLAYOUT-FORK.md.
 
 // QUEUE 1-10 <clip> [producer parameters] [transition] [AUTO] [TAG <tag>] [EXPECT <tag>]
 std::future<std::wstring> queue_command(command_context& ctx)
@@ -1926,6 +1926,7 @@ std::future<std::wstring> queue_info_command(command_context& ctx)
     return reply_from_stage(ctx, L"QUEUE INFO", [=](core::stage_sync_ops& s) -> std::wstring {
         auto*      layer    = s.find_layer(index);
         const auto snapshot = layer ? layer->snapshot() : core::layer_snapshot{};
+        const auto fallback = s.get_fallback(index);
 
         std::wstringstream json;
         json << L"{\"channel\":" << channel << L",\"layer\":" << index << L",\"instance\":" << server_instance
@@ -1952,7 +1953,12 @@ std::future<std::wstring> queue_info_command(command_context& ctx)
                  << L",\"producer\":" << json_string(item.producer)
                  << L",\"auto\":" << (item.auto_play ? L"true" : L"false") << L"}";
         }
-        json << L"]}";
+        json << L"]";
+
+        json << L",\"fallback\":{\"set\":" << (fallback.producer != frame_producer::empty() ? L"true" : L"false")
+             << L",\"tag\":" << json_string(fallback.tag)
+             << L",\"active\":" << (snapshot.fallback_active ? L"true" : L"false")
+             << L",\"stall\":" << fallback.stall_limit << L"}}";
 
         return L"201 QUEUE INFO OK\r\n" + json.str() + L"\r\n";
     });
@@ -1988,6 +1994,67 @@ std::future<std::wstring> events_command(command_context& ctx)
         json << L"]}";
 
         return L"201 EVENTS OK\r\n" + json.str() + L"\r\n";
+    });
+}
+
+// FALLBACK 1-10 <clip> [producer parameters] [TAG <tag>] [STALL <frames>]
+std::future<std::wstring> fallback_command(command_context& ctx)
+{
+    core::diagnostics::scoped_call_context save;
+    core::diagnostics::call_context::for_thread().video_channel = ctx.channel_index + 1;
+    core::diagnostics::call_context::for_thread().layer         = ctx.layer_index();
+
+    const auto tag   = take_tag(ctx.parameters, 1);
+    const auto stall = take_param(L"STALL", ctx.parameters, 1);
+    const int  stall_frames = stall ? boost::lexical_cast<int>(*stall) : -1;
+    if (stall && stall_frames < 0)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"STALL must be 0 or more frames."));
+
+    const auto producer = ctx.static_context->producer_registry->create_producer(
+        get_producer_dependencies(ctx.channel.raw_channel, ctx), ctx.parameters);
+    if (producer == frame_producer::empty())
+        CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(ctx.parameters.at(0)));
+
+    const int index = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"FALLBACK", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto config     = s.get_fallback(index);
+        config.producer = producer;
+        config.tag      = tag.empty() ? L"fallback" : tag;
+        if (stall_frames >= 0)
+            config.stall_limit = stall_frames;
+        s.set_fallback(index, config);
+        return L"202 FALLBACK OK\r\n";
+    });
+}
+
+// FALLBACK 1-10 CLEAR: removes the fallback clip. The STALL limit stays.
+std::future<std::wstring> fallback_clear_command(command_context& ctx)
+{
+    const int index = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"FALLBACK CLEAR", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto config     = s.get_fallback(index);
+        config.producer = frame_producer::empty();
+        config.tag.clear();
+        s.set_fallback(index, config);
+        return L"202 FALLBACK CLEAR OK\r\n";
+    });
+}
+
+// FALLBACK 1-10 STALL <frames>: frames without a new frame before failover. 0 = off.
+std::future<std::wstring> fallback_stall_command(command_context& ctx)
+{
+    const int frames = boost::lexical_cast<int>(ctx.parameters.at(0));
+    if (frames < 0)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"STALL must be 0 or more frames."));
+    const int index = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"FALLBACK STALL", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto config        = s.get_fallback(index);
+        config.stall_limit = frames;
+        s.set_fallback(index, config);
+        return L"202 FALLBACK STALL OK\r\n";
     });
 }
 
@@ -2220,6 +2287,9 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"PlayOut Commands", L"QUEUE REMOVE", queue_remove_command, 1);
     repo->register_channel_command(L"PlayOut Commands", L"QUEUE INFO", queue_info_command, 0);
     repo->register_channel_command(L"PlayOut Commands", L"ONAIR", onair_command, 2);
+    repo->register_channel_command(L"PlayOut Commands", L"FALLBACK", fallback_command, 1);
+    repo->register_channel_command(L"PlayOut Commands", L"FALLBACK CLEAR", fallback_clear_command, 0);
+    repo->register_channel_command(L"PlayOut Commands", L"FALLBACK STALL", fallback_stall_command, 1);
     repo->register_channel_command(L"PlayOut Commands", L"EVENTS", events_command, 0);
 
     repo->register_command(L"Query Commands", L"OSC SUBSCRIBE", osc_subscribe_command, 1);

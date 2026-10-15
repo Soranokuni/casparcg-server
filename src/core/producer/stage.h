@@ -149,6 +149,9 @@ class stage_sync_ops
     // The layer at index, or nullptr.
     virtual layer* find_layer(int index) = 0;
 
+    virtual void            set_fallback(int index, const fallback_config& config) = 0;
+    virtual fallback_config get_fallback(int index) const                          = 0;
+
     // Applies the stage operations, then calls the deferred work.
     virtual void run_actions(const item_actions& actions) = 0;
 

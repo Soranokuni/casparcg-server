@@ -71,7 +71,11 @@ struct layer::impl
     item_info                                  foreground_info_;
     item_info                                  background_info_;
     std::deque<queued_item>                    queue_;
+    fallback_config                            fallback_;
+    bool                                       fallback_active_ = false;
     bool                                       ended_reported_  = false;
+    bool                                       fg_delivered_    = false; // the foreground has delivered a frame
+    int                                        stall_count_     = 0;     // ticks without a new frame since then
     std::int64_t                               frames_left_     = 0;
     std::vector<layer_event>                   events_;
     std::vector<std::shared_ptr<item_actions>> pending_actions_;
@@ -84,6 +88,7 @@ struct layer::impl
         std::wstring                  visible_tag; // the item still on air
         std::shared_ptr<item_actions> actions;     // of the new foreground
         const char*                   reason = "";
+        int                           waited = 0; // ticks without the new foreground being ready
     } switch_;
 
   public:
@@ -116,11 +121,15 @@ struct layer::impl
 
         foreground_      = std::move(producer);
         foreground_info_ = std::move(info);
+        fallback_active_ = false;
         ended_reported_  = false;
+        fg_delivered_    = false;
+        stall_count_     = 0;
 
         switch_.active  = true;
         switch_.actions = std::move(foreground_info_.actions);
         switch_.reason  = reason;
+        switch_.waited  = 0;
 
         foreground_info_.actions = nullptr;
     }
@@ -130,8 +139,20 @@ struct layer::impl
 
     void report_switch()
     {
-        if (!switch_.active || !foreground_->is_ready())
+        if (!switch_.active)
             return;
+
+        if (!foreground_->is_ready()) {
+            switch_.waited += 1;
+            if (fallback_.stall_limit > 0 && switch_.waited >= fallback_.stall_limit) {
+                CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" not ready after " << switch_.waited
+                                    << L" frames.";
+                emit("stalled", foreground_info_.tag, "start");
+                switch_.waited = 0;
+                fail_over("stall");
+            }
+            return;
+        }
 
         emit("offair", switch_.visible_tag, switch_.reason);
         emit("onair", foreground_info_.tag, switch_.reason);
@@ -156,11 +177,12 @@ struct layer::impl
         auto_play_       = item.auto_play;
     }
 
-    // An AUTO background replaces an empty foreground at once.
+    // An AUTO background replaces an empty foreground or the fallback at once.
     void play_if_auto_ready()
     {
-        if (auto_play_ && background_ != frame_producer::empty() && foreground_ == frame_producer::empty()) {
-            play("auto");
+        if (auto_play_ && background_ != frame_producer::empty() &&
+            (foreground_ == frame_producer::empty() || fallback_active_)) {
+            play("auto", true);
         }
     }
 
@@ -182,8 +204,8 @@ struct layer::impl
         background_info_ = std::move(info);
         auto_play_       = auto_play;
 
-        if (auto_play_ && foreground_ == frame_producer::empty()) {
-            play("auto");
+        if (auto_play_ && (foreground_ == frame_producer::empty() || fallback_active_)) {
+            play("auto", true);
         } else if (preview_producer) {
             preview(true);
         }
@@ -192,15 +214,19 @@ struct layer::impl
     void preview(bool force)
     {
         if (force || background_ != frame_producer::empty()) {
-            play("take");
+            play("take", true);
             paused_ = true;
         }
     }
 
-    void play(const char* reason)
+    // lead = false starts the new foreground without the old one as its leading producer, so a
+    // failed producer is never pulled again by a transition.
+    void play(const char* reason, bool lead)
     {
         if (background_ != frame_producer::empty()) {
-            if (!paused_) {
+            if (!lead) {
+                background_->leading_producer(frame_producer::empty());
+            } else if (!paused_) {
                 background_->leading_producer(foreground_);
             } else {
                 if (format_desc_.field_count == 2) {
@@ -235,7 +261,37 @@ struct layer::impl
         foreground_      = frame_producer::empty();
         foreground_info_ = {};
         auto_play_       = false;
+        fallback_active_ = false;
         ended_reported_  = false;
+        fg_delivered_    = false;
+        stall_count_     = 0;
+    }
+
+    bool activate_fallback(const char* reason)
+    {
+        if (fallback_.producer == frame_producer::empty())
+            return false;
+
+        if (!fallback_active_) {
+            CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" replaced by fallback "
+                                << fallback_.producer->print() << L" (" << reason << L").";
+            set_foreground(fallback_.producer, item_info{fallback_.tag, nullptr}, reason);
+            fallback_active_ = true;
+            paused_          = false;
+        }
+        return true;
+    }
+
+    // Replaces a failed foreground: the AUTO background first, then the fallback.
+    bool fail_over(const char* reason)
+    {
+        if (auto_play_ && background_ != frame_producer::empty()) {
+            CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" replaced by the next item (" << reason
+                                << L").";
+            play(reason, false);
+            return true;
+        }
+        return activate_fallback(reason);
     }
 
     std::vector<std::shared_ptr<item_actions>> prepare()
@@ -245,6 +301,8 @@ struct layer::impl
             if (foreground_->following_producer() != core::frame_producer::empty()) {
                 foreground_ = foreground_->following_producer();
             }
+
+            play_if_auto_ready();
 
             const auto nb_frames = foreground_->nb_frames();
             const bool ended     = nb_frames != std::numeric_limits<std::uint32_t>::max() &&
@@ -256,6 +314,7 @@ struct layer::impl
             }
 
             frames_left_ = 0;
+            bool played  = false;
             if (auto_play_) {
                 auto auto_play_delta = background_->auto_play_delta();
                 if (auto_play_delta) {
@@ -263,15 +322,30 @@ struct layer::impl
                     auto duration = static_cast<std::int64_t>(nb_frames);
                     frames_left_  = duration - time - *auto_play_delta;
                     if (frames_left_ < 1) {
-                        play("auto");
+                        play("auto", true);
+                        played = true;
                     }
+                }
+            }
+
+            if (!played && !paused_) {
+                if (ended && !fallback_active_) {
+                    activate_fallback("ended");
+                } else if (fallback_.stall_limit > 0 && stall_count_ >= fallback_.stall_limit) {
+                    CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" delivered no frame for "
+                                        << stall_count_ << L" frames.";
+                    emit("stalled", foreground_info_.tag, "stall");
+                    stall_count_ = 0;
+                    fail_over("stall");
                 }
             }
 
             report_switch();
         } catch (...) {
             CASPAR_LOG_CURRENT_EXCEPTION();
-            stop("error");
+            if (!fail_over("error")) {
+                stop("error");
+            }
         }
 
         auto actions = std::move(pending_actions_);
@@ -308,12 +382,27 @@ struct layer::impl
             }
             state_["queue"]["tags"] = tags;
         }
+        if (fallback_.producer != frame_producer::empty()) {
+            state_["fallback"]["tag"]    = fallback_.tag;
+            state_["fallback"]["active"] = fallback_active_;
+        }
     }
 
     draw_frame receive(const video_field field, int nb_samples)
     {
         try {
             auto frame = paused_ ? core::draw_frame{} : foreground_->receive(field, nb_samples);
+
+            // PlayOut fork: count ticks without a new frame once the foreground has started.
+            if (!paused_ && field != video_field::b) {
+                if (frame) {
+                    fg_delivered_ = true;
+                    stall_count_  = 0;
+                } else if (fg_delivered_) {
+                    stall_count_ += 1;
+                }
+            }
+
             if (!frame) {
                 frame = foreground_->last_frame(field);
             }
@@ -323,6 +412,17 @@ struct layer::impl
             return frame;
         } catch (...) {
             CASPAR_LOG_CURRENT_EXCEPTION();
+
+            // PlayOut fork: hand over to the AUTO background or the fallback instead of going black.
+            if (fail_over("error")) {
+                try {
+                    auto frame = foreground_->receive(field, nb_samples);
+                    return frame ? frame : foreground_->last_frame(field);
+                } catch (...) {
+                    CASPAR_LOG_CURRENT_EXCEPTION();
+                }
+            }
+
             stop("error");
             return draw_frame{};
         }
@@ -451,6 +551,7 @@ struct layer::impl
         result.nb_frames           = foreground_->nb_frames();
         result.paused              = paused_;
         result.starting            = switch_.active;
+        result.fallback_active     = fallback_active_;
 
         if (background_ != frame_producer::empty()) {
             result.waiting.push_back({background_info_.tag, background_->name(), auto_play_});
@@ -485,7 +586,7 @@ void layer::load(spl::shared_ptr<frame_producer> frame_producer,
 {
     return impl_->load(std::move(frame_producer), preview, auto_play, std::move(info), clear_queue);
 }
-void       layer::play() { impl_->play("take"); }
+void       layer::play() { impl_->play("take", true); }
 void       layer::preview() { impl_->preview(false); }
 void       layer::pause() { impl_->pause(); }
 void       layer::resume() { impl_->resume(); }
@@ -512,6 +613,7 @@ layer::attach_result layer::attach_actions(const std::wstring& tag, const std::s
 {
     return impl_->attach_actions(tag, actions);
 }
+void layer::set_fallback(const fallback_config& config) { impl_->fallback_ = config; }
 void layer::on_clear() { impl_->emit("offair", impl_->visible_tag(), "clear"); }
 std::vector<layer_event> layer::take_events()
 {

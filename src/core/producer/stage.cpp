@@ -121,6 +121,12 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             auto it = self.layers_.find(index);
             return it == self.layers_.end() ? nullptr : &it->second;
         }
+        void            set_fallback(int index, const fallback_config& config) override { self.do_set_fallback(index, config); }
+        fallback_config get_fallback(int index) const override
+        {
+            auto it = self.fallbacks_.find(index);
+            return it == self.fallbacks_.end() ? fallback_config{} : it->second;
+        }
         void run_actions(const item_actions& actions) override { self.run_actions(actions); }
         std::vector<layer_event> events(int index, std::uint64_t since) const override
         {
@@ -164,6 +170,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     // PlayOut fork
     std::map<int, layer_event_log>          event_logs_;
     std::map<int, std::vector<layer_event>> orphan_events_; // not yet stamped: cleared layers, log_event()
+    std::map<int, fallback_config>          fallbacks_;
     std::uint64_t                           last_frame_ = 0;
     sync_access                             sync_{*this};
 
@@ -216,12 +223,18 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         auto it = layers_.find(index);
         if (it == std::end(layers_)) {
             it = layers_.emplace(index, layer(video_format_desc())).first;
+
+            // PlayOut fork: a new layer gets the fallback configured for its index.
+            auto fallback = fallbacks_.find(index);
+            if (fallback != fallbacks_.end()) {
+                it->second.set_fallback(fallback->second);
+            }
         }
         return it->second;
     }
 
-    // PlayOut fork: AUTO, the end of the foreground and on-air actions are handled before any layer
-    // is drawn, so the result of an on-air action shows on the item's first frame.
+    // PlayOut fork: AUTO, the end of the foreground, stalls and on-air actions are handled before any
+    // layer is drawn, so the result of an on-air action shows on the item's first frame.
     void prepare_layers(std::uint64_t frame_number)
     {
         const auto time_ms = unix_time_ms();
@@ -344,6 +357,16 @@ struct stage::impl : public std::enable_shared_from_this<impl>
     {
         while (!layers_.empty()) {
             do_clear(layers_.begin()->first);
+        }
+    }
+
+    void do_set_fallback(int index, const fallback_config& config)
+    {
+        fallbacks_[index] = config;
+
+        auto it = layers_.find(index);
+        if (it != layers_.end()) {
+            it->second.set_fallback(config);
         }
     }
 
@@ -689,6 +712,13 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             }
 
             do_clear_all();
+
+            // PlayOut fork: fallback producers were made for the old format.
+            if (!fallbacks_.empty()) {
+                CASPAR_LOG(warning) << L"[stage] " << channel_index_
+                                    << L" Video format changed: fallbacks removed.";
+                fallbacks_.clear();
+            }
         });
     }
 };

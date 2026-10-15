@@ -58,9 +58,9 @@ class layer final
     void resume();
     void stop();
 
-    // PlayOut fork: runs once per tick, before receive(). Promotes an AUTO background and reports
-    // the end of the foreground. Returns the actions of the items that went on air since the last
-    // call.
+    // PlayOut fork: runs once per tick, before receive(). Promotes an AUTO background, reports the
+    // end of the foreground and fails over on a stall. Returns the actions of the items that went
+    // on air since the last call.
     std::vector<std::shared_ptr<item_actions>> prepare();
 
     draw_frame receive(const video_field field, int nb_samples);
@@ -88,6 +88,7 @@ class layer final
     int           queue_clear(const std::wstring& after_tag);
     bool          queue_remove(const std::wstring& tag);
     attach_result attach_actions(const std::wstring& tag, const std::shared_ptr<item_actions>& actions);
+    void          set_fallback(const fallback_config& config);
     void          on_clear();
     std::vector<layer_event> take_events();
     layer_snapshot           snapshot() const;
