@@ -118,7 +118,11 @@ struct ffmpeg_producer : public core::frame_producer
 
     std::uint32_t frame_number() const override
     {
-        return static_cast<std::uint32_t>(producer_->time() - producer_->start());
+        // PlayOut fork: before the first frame of a clip played with SEEK, time() is 0 while start()
+        // is the SEEK point. The difference wrapped to about 4e9, so an AUTO background loaded in
+        // that window went on air at once and skipped this clip.
+        const auto frame = producer_->time() - producer_->start();
+        return frame > 0 ? static_cast<std::uint32_t>(frame) : 0;
     }
 
     std::uint32_t nb_frames() const override
