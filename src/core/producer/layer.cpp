@@ -30,9 +30,21 @@
 
 #include <common/log.h>
 
+#include <deque>
 #include <limits>
 
 namespace caspar { namespace core {
+
+namespace {
+
+struct queued_item
+{
+    spl::shared_ptr<frame_producer> producer  = frame_producer::empty();
+    bool                            auto_play = false;
+    item_info                       info;
+};
+
+} // namespace
 
 struct layer::impl
 {
@@ -48,6 +60,7 @@ struct layer::impl
     // PlayOut fork
     item_info                                  foreground_info_;
     item_info                                  background_info_;
+    std::deque<queued_item>                    queue_;
     bool                                       ended_reported_  = false;
     std::int64_t                               frames_left_     = 0;
     std::vector<layer_event>                   events_;
@@ -109,12 +122,42 @@ struct layer::impl
         switch_ = {};
     }
 
+    // The background is the head of the queue.
+    void promote_queue()
+    {
+        if (background_ != frame_producer::empty() || queue_.empty())
+            return;
+
+        auto item = std::move(queue_.front());
+        queue_.pop_front();
+
+        background_      = std::move(item.producer);
+        background_info_ = std::move(item.info);
+        auto_play_       = item.auto_play;
+    }
+
+    // An AUTO background replaces an empty foreground at once.
+    void play_if_auto_ready()
+    {
+        if (auto_play_ && background_ != frame_producer::empty() && foreground_ == frame_producer::empty()) {
+            play("auto");
+        }
+    }
+
     void pause() { paused_ = true; }
 
     void resume() { paused_ = false; }
 
-    void load(spl::shared_ptr<frame_producer> producer, bool preview_producer, bool auto_play, item_info info)
+    void load(spl::shared_ptr<frame_producer> producer,
+              bool                            preview_producer,
+              bool                            auto_play,
+              item_info                       info,
+              bool                            clear_queue)
     {
+        if (clear_queue) {
+            queue_.clear();
+        }
+
         background_      = std::move(producer);
         background_info_ = std::move(info);
         auto_play_       = auto_play;
@@ -158,6 +201,7 @@ struct layer::impl
             auto_play_       = false;
 
             set_foreground(std::move(producer), std::move(info), reason);
+            promote_queue();
         }
 
         paused_ = false;
@@ -233,6 +277,13 @@ struct layer::impl
             state_["background"]["tag"]  = background_info_.tag;
             state_["background"]["auto"] = auto_play_;
         }
+        if (!queue_.empty()) {
+            std::vector<std::wstring> tags;
+            for (const auto& item : queue_) {
+                tags.push_back(item.info.tag);
+            }
+            state_["queue"]["tags"] = tags;
+        }
     }
 
     draw_frame receive(const video_field field, int nb_samples)
@@ -264,6 +315,95 @@ struct layer::impl
             return draw_frame{};
         }
     }
+
+    void queue_push(spl::shared_ptr<frame_producer> producer, bool auto_play, item_info info)
+    {
+        if (background_ == frame_producer::empty()) {
+            background_      = std::move(producer);
+            background_info_ = std::move(info);
+            auto_play_       = auto_play;
+            play_if_auto_ready();
+        } else {
+            queued_item item;
+            item.producer  = std::move(producer);
+            item.auto_play = auto_play;
+            item.info      = std::move(info);
+            queue_.push_back(std::move(item));
+        }
+    }
+
+    int queue_clear(const std::wstring& after_tag)
+    {
+        if (after_tag.empty() || after_tag == foreground_info_.tag) {
+            const int removed = (background_ != frame_producer::empty() ? 1 : 0) + static_cast<int>(queue_.size());
+            background_       = frame_producer::empty();
+            background_info_  = {};
+            auto_play_        = false;
+            queue_.clear();
+            return removed;
+        }
+
+        if (background_ != frame_producer::empty() && background_info_.tag == after_tag) {
+            const int removed = static_cast<int>(queue_.size());
+            queue_.clear();
+            return removed;
+        }
+
+        for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+            if (it->info.tag == after_tag) {
+                const int removed = static_cast<int>(std::distance(std::next(it), queue_.end()));
+                queue_.erase(std::next(it), queue_.end());
+                return removed;
+            }
+        }
+
+        return -1;
+    }
+
+    bool queue_remove(const std::wstring& tag)
+    {
+        if (tag.empty())
+            return false;
+
+        if (background_ != frame_producer::empty() && background_info_.tag == tag) {
+            background_      = frame_producer::empty();
+            background_info_ = {};
+            auto_play_       = false;
+            promote_queue();
+            play_if_auto_ready();
+            return true;
+        }
+
+        for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+            if (it->info.tag == tag) {
+                queue_.erase(it);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    layer_snapshot snapshot() const
+    {
+        layer_snapshot result;
+        result.exists              = true;
+        result.foreground_tag      = foreground_info_.tag;
+        result.foreground_producer = foreground_->name();
+        result.frame_number        = foreground_->frame_number();
+        result.nb_frames           = foreground_->nb_frames();
+        result.paused              = paused_;
+        result.starting            = switch_.active;
+
+        if (background_ != frame_producer::empty()) {
+            result.waiting.push_back({background_info_.tag, background_->name(), auto_play_});
+        }
+        for (const auto& item : queue_) {
+            result.waiting.push_back({item.info.tag, item.producer->name(), item.auto_play});
+        }
+
+        return result;
+    }
 };
 
 layer::layer(const core::video_format_desc format_desc)
@@ -280,9 +420,13 @@ layer& layer::operator=(layer&& other)
     return *this;
 }
 void layer::swap(layer& other) { impl_.swap(other.impl_); }
-void layer::load(spl::shared_ptr<frame_producer> frame_producer, bool preview, bool auto_play, item_info info)
+void layer::load(spl::shared_ptr<frame_producer> frame_producer,
+                 bool                            preview,
+                 bool                            auto_play,
+                 item_info                       info,
+                 bool                            clear_queue)
 {
-    return impl_->load(std::move(frame_producer), preview, auto_play, std::move(info));
+    return impl_->load(std::move(frame_producer), preview, auto_play, std::move(info), clear_queue);
 }
 void       layer::play() { impl_->play("take"); }
 void       layer::preview() { impl_->preview(false); }
@@ -299,7 +443,14 @@ spl::shared_ptr<frame_producer> layer::background() const { return impl_->backgr
 bool                            layer::has_background() const { return impl_->background_ != frame_producer::empty(); }
 core::monitor::state            layer::state() const { return impl_->state_; }
 
-void layer::prepare() { impl_->prepare(); }
+void                layer::prepare() { impl_->prepare(); }
+const std::wstring& layer::foreground_tag() const { return impl_->foreground_info_.tag; }
+void layer::queue_push(spl::shared_ptr<frame_producer> producer, bool auto_play, item_info info)
+{
+    impl_->queue_push(std::move(producer), auto_play, std::move(info));
+}
+int                  layer::queue_clear(const std::wstring& after_tag) { return impl_->queue_clear(after_tag); }
+bool                 layer::queue_remove(const std::wstring& tag) { return impl_->queue_remove(tag); }
 void layer::on_clear() { impl_->emit("offair", impl_->visible_tag(), "clear"); }
 std::vector<layer_event> layer::take_events()
 {
@@ -307,4 +458,5 @@ std::vector<layer_event> layer::take_events()
     impl_->events_.clear();
     return events;
 }
+layer_snapshot layer::snapshot() const { return impl_->snapshot(); }
 }} // namespace caspar::core

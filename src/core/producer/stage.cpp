@@ -450,10 +450,15 @@ struct stage::impl : public std::enable_shared_from_this<impl>
         return executor_.begin_invoke([=] { return tweens_[index].fetch(); });
     }
 
-    std::future<void>
-    load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play, const item_info& info)
+    std::future<void> load(int                                    index,
+                           const spl::shared_ptr<frame_producer>& producer,
+                           bool                                   preview,
+                           bool                                   auto_play,
+                           const item_info&                       info,
+                           bool                                   clear_queue)
     {
-        return executor_.begin_invoke([=] { get_layer(index).load(producer, preview, auto_play, info); });
+        return executor_.begin_invoke(
+            [=] { get_layer(index).load(producer, preview, auto_play, info, clear_queue); });
     }
 
     std::future<void> invoke_sync(std::function<void(stage_sync_ops&)> func)
@@ -628,10 +633,14 @@ std::future<void> stage::apply_transform(int                                    
 std::future<void>            stage::clear_transforms(int index) { return impl_->clear_transforms(index); }
 std::future<void>            stage::clear_transforms() { return impl_->clear_transforms(); }
 std::future<frame_transform> stage::get_current_transform(int index) { return impl_->get_current_transform(index); }
-std::future<void>
-stage::load(int index, const spl::shared_ptr<frame_producer>& producer, bool preview, bool auto_play, item_info info)
+std::future<void> stage::load(int                                    index,
+                              const spl::shared_ptr<frame_producer>& producer,
+                              bool                                   preview,
+                              bool                                   auto_play,
+                              item_info                              info,
+                              bool                                   clear_queue)
 {
-    return impl_->load(index, producer, preview, auto_play, info);
+    return impl_->load(index, producer, preview, auto_play, info, clear_queue);
 }
 std::future<void> stage::invoke_sync(std::function<void(stage_sync_ops&)> func)
 {
@@ -726,9 +735,11 @@ std::future<void> stage_delayed::load(int                                    ind
                                       const spl::shared_ptr<frame_producer>& producer,
                                       bool                                   preview,
                                       bool                                   auto_play,
-                                      item_info                              info)
+                                      item_info                              info,
+                                      bool                                   clear_queue)
 {
-    return executor_.begin_invoke([=]() { return stage_->load(index, producer, preview, auto_play, info).get(); });
+    return executor_.begin_invoke(
+        [=]() { return stage_->load(index, producer, preview, auto_play, info, clear_queue).get(); });
 }
 std::future<void> stage_delayed::invoke_sync(std::function<void(stage_sync_ops&)> func)
 {

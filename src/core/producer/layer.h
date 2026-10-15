@@ -46,10 +46,12 @@ class layer final
 
     void swap(layer& other);
 
+    // clear_queue drops the waiting items first (PLAY and LOAD with a producer are takes).
     void load(spl::shared_ptr<frame_producer> producer,
               bool                            preview,
-              bool                            auto_play = false,
-              item_info                       info      = {});
+              bool                            auto_play   = false,
+              item_info                       info        = {},
+              bool                            clear_queue = false);
     void play();
     void preview();
     void pause();
@@ -69,9 +71,17 @@ class layer final
     spl::shared_ptr<frame_producer> background() const;
     bool                            has_background() const;
 
-    // PlayOut fork: item tags and the event log.
-    void                     on_clear();
+    // PlayOut fork: the wait queue. The background is the head of the queue: when it goes on air,
+    // the next queued item moves into the background.
+    const std::wstring& foreground_tag() const;
+    void                queue_push(spl::shared_ptr<frame_producer> producer, bool auto_play, item_info info);
+    // Removes the waiting items after the item tagged after_tag (all of them when after_tag is
+    // empty or on air). Returns the number removed, or -1 when after_tag is not on the layer.
+    int           queue_clear(const std::wstring& after_tag);
+    bool          queue_remove(const std::wstring& tag);
+    void          on_clear();
     std::vector<layer_event> take_events();
+    layer_snapshot           snapshot() const;
 
   private:
     struct impl;

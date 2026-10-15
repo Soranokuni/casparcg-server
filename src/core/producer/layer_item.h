@@ -17,13 +17,15 @@
  * along with CasparCG. If not, see <http://www.gnu.org/licenses/>.
  */
 
-// PlayOut fork: item identity (TAG) and the layer event log (EVENTS). See PLAYOUT-FORK.md in the
-// repository root.
+// PlayOut fork: item identity (TAG), the wait queue (QUEUE) and the layer event log (EVENTS). See
+// PLAYOUT-FORK.md in the repository root.
 
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <vector>
 
 namespace caspar { namespace core {
 
@@ -44,6 +46,26 @@ struct layer_event
     std::string   kind;        // "onair", "offair", "ended", "stalled", "actionfailed"
     std::wstring  tag;
     std::string   reason; // "auto", "take", "stop", "clear", "error", "stall", "ended", ...
+};
+
+// A read-only view of the items on a layer, for QUEUE INFO.
+struct layer_snapshot
+{
+    struct waiting_item
+    {
+        std::wstring tag;
+        std::wstring producer;
+        bool         auto_play = false;
+    };
+
+    bool                      exists = false;
+    std::wstring              foreground_tag;
+    std::wstring              foreground_producer;
+    std::uint32_t             frame_number = 0;
+    std::uint32_t             nb_frames    = std::numeric_limits<std::uint32_t>::max();
+    bool                      paused       = false;
+    bool                      starting     = false; // the foreground has not shown its first frame yet
+    std::vector<waiting_item> waiting;              // the background first, then the queue
 };
 
 }} // namespace caspar::core

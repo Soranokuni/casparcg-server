@@ -52,6 +52,7 @@
 #include <core/producer/color/color_producer.h>
 #include <core/producer/frame_producer.h>
 #include <core/producer/frame_producer_registry.h>
+#include <core/producer/layer.h>
 #include <core/producer/stage.h>
 #include <core/producer/transition/sting_producer.h>
 #include <core/producer/transition/transition_producer.h>
@@ -275,7 +276,7 @@ bool try_match_sting(const std::vector<std::wstring>& params, sting_info& stingI
     return true;
 }
 
-// PlayOut fork: helpers for TAG and the JSON replies. See PLAYOUT-FORK.md.
+// PlayOut fork: helpers for TAG, EXPECT and the JSON replies. See PLAYOUT-FORK.md.
 
 const std::int64_t server_instance =
     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
@@ -317,6 +318,18 @@ std::wstring take_tag(std::vector<std::wstring>& params, std::size_t first)
 {
     auto tag = take_param(L"TAG", params, first);
     return tag ? check_tag(*tag) : L"";
+}
+
+// EXPECT <tag>: run only when <tag> is on air. "EXPECT -" means: no tagged item on air.
+std::optional<std::wstring> take_expect(std::vector<std::wstring>& params, std::size_t first)
+{
+    auto expect = take_param(L"EXPECT", params, first);
+    if (expect) {
+        if (*expect == L"-")
+            return std::wstring();
+        check_tag(*expect);
+    }
+    return expect;
 }
 
 std::wstring json_string(const std::wstring& value)
@@ -374,7 +387,7 @@ std::future<std::wstring> reply_from_stage(command_context&                     
 
 // Basic Commands
 
-// The producer for LOADBG and PLAY, wrapped in its transition or sting.
+// The producer for LOADBG, PLAY and QUEUE, wrapped in its transition or sting.
 spl::shared_ptr<frame_producer> create_background_producer(command_context& ctx)
 {
     auto channel = ctx.channel.raw_channel;
@@ -401,7 +414,8 @@ spl::shared_ptr<frame_producer> create_background_producer(command_context& ctx)
     return create_transition_producer(new_producer, transitionInfo);
 }
 
-std::wstring loadbg_command(command_context& ctx)
+// clear_queue: PLAY with a clip is a take, so it also drops the waiting items (PlayOut fork).
+std::wstring loadbg(command_context& ctx, bool clear_queue)
 {
     // Perform loading of the clip
     core::diagnostics::scoped_call_context save;
@@ -417,17 +431,24 @@ std::wstring loadbg_command(command_context& ctx)
 
         // TODO - we should pass the format into load(), so that we can catch it having changed since the producer was
         // initialised
-        ctx.channel.stage->load(ctx.layer_index(), transition_producer, false, auto_play, info); // TODO: LOOP
+        ctx.channel.stage->load(
+            ctx.layer_index(), transition_producer, false, auto_play, info, clear_queue); // TODO: LOOP
     } catch (file_not_found&) {
         if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
-            ctx.channel.stage->load(
-                ctx.layer_index(), core::create_color_producer(channel->frame_factory(), 0), false, auto_play);
+            ctx.channel.stage->load(ctx.layer_index(),
+                                    core::create_color_producer(channel->frame_factory(), 0),
+                                    false,
+                                    auto_play,
+                                    {},
+                                    clear_queue);
         }
         throw;
     }
 
     return L"202 LOADBG OK\r\n";
 }
+
+std::wstring loadbg_command(command_context& ctx) { return loadbg(ctx, false); }
 
 std::wstring load_command(command_context& ctx)
 {
@@ -445,11 +466,15 @@ std::wstring load_command(command_context& ctx)
                 get_producer_dependencies(ctx.channel.raw_channel, ctx), ctx.parameters);
             auto transition_producer = create_transition_producer(new_producer, transition_info{});
 
-            ctx.channel.stage->load(ctx.layer_index(), transition_producer, true, false, info);
+            ctx.channel.stage->load(ctx.layer_index(), transition_producer, true, false, info, true);
         } catch (file_not_found&) {
             if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
-                ctx.channel.stage->load(
-                    ctx.layer_index(), core::create_color_producer(ctx.channel.raw_channel->frame_factory(), 0), true);
+                ctx.channel.stage->load(ctx.layer_index(),
+                                        core::create_color_producer(ctx.channel.raw_channel->frame_factory(), 0),
+                                        true,
+                                        false,
+                                        {},
+                                        true);
             }
             throw;
         }
@@ -462,7 +487,7 @@ std::wstring play_command(command_context& ctx)
 {
     try {
         if (!ctx.parameters.empty())
-            loadbg_command(ctx);
+            loadbg(ctx, true);
     } catch (file_not_found&) {
         if (contains_param(L"CLEAR_ON_404", ctx.parameters)) {
             ctx.channel.stage->play(ctx.layer_index());
@@ -1822,7 +1847,114 @@ std::wstring osc_unsubscribe_command(command_context& ctx)
     return L"202 OSC UNSUBSCRIBE OK\r\n";
 }
 
-// PlayOut fork: EVENTS. See PLAYOUT-FORK.md.
+// PlayOut fork: QUEUE and EVENTS. See PLAYOUT-FORK.md.
+
+// QUEUE 1-10 <clip> [producer parameters] [transition] [AUTO] [TAG <tag>] [EXPECT <tag>]
+std::future<std::wstring> queue_command(command_context& ctx)
+{
+    core::diagnostics::scoped_call_context save;
+    core::diagnostics::call_context::for_thread().video_channel = ctx.channel_index + 1;
+    core::diagnostics::call_context::for_thread().layer         = ctx.layer_index();
+
+    const auto            expect = take_expect(ctx.parameters, 1);
+    const core::item_info info{take_tag(ctx.parameters, 1)};
+    const bool            auto_play = contains_param(L"AUTO", ctx.parameters);
+    const auto            producer  = create_background_producer(ctx);
+    const int             index     = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"QUEUE", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto& layer = s.get_layer(index);
+        if (expect && layer.foreground_tag() != *expect)
+            return L"409 QUEUE CONFLICT\r\n";
+
+        layer.queue_push(producer, auto_play, info);
+        return L"202 QUEUE OK\r\n";
+    });
+}
+
+// QUEUE 1-10 CLEAR [AFTER <tag>] [EXPECT <tag>]
+std::future<std::wstring> queue_clear_command(command_context& ctx)
+{
+    const auto expect = take_expect(ctx.parameters, 0);
+    const auto after  = take_param(L"AFTER", ctx.parameters, 0);
+    if (after)
+        check_tag(*after);
+    const int index = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"QUEUE CLEAR", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto*      layer      = s.find_layer(index);
+        const auto foreground = layer ? layer->foreground_tag() : std::wstring();
+        if (expect && foreground != *expect)
+            return L"409 QUEUE CLEAR CONFLICT\r\n";
+
+        const int removed = layer ? layer->queue_clear(after.value_or(L"")) : (after ? -1 : 0);
+        if (removed < 0)
+            return L"404 QUEUE CLEAR FAILED\r\n";
+
+        return L"201 QUEUE CLEAR OK\r\n" + std::to_wstring(removed) + L"\r\n";
+    });
+}
+
+// QUEUE 1-10 REMOVE <tag> [EXPECT <tag>]
+std::future<std::wstring> queue_remove_command(command_context& ctx)
+{
+    const auto expect = take_expect(ctx.parameters, 1);
+    const auto tag    = check_tag(ctx.parameters.at(0));
+    const int  index  = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"QUEUE REMOVE", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto*      layer      = s.find_layer(index);
+        const auto foreground = layer ? layer->foreground_tag() : std::wstring();
+        if (expect && foreground != *expect)
+            return L"409 QUEUE REMOVE CONFLICT\r\n";
+
+        if (!layer || !layer->queue_remove(tag))
+            return L"404 QUEUE REMOVE FAILED\r\n";
+
+        return L"202 QUEUE REMOVE OK\r\n";
+    });
+}
+
+// QUEUE 1-10 INFO: what is on air and waiting, as one line of JSON.
+std::future<std::wstring> queue_info_command(command_context& ctx)
+{
+    const int channel = ctx.channel_index + 1;
+    const int index   = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"QUEUE INFO", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto*      layer    = s.find_layer(index);
+        const auto snapshot = layer ? layer->snapshot() : core::layer_snapshot{};
+
+        std::wstringstream json;
+        json << L"{\"channel\":" << channel << L",\"layer\":" << index << L",\"instance\":" << server_instance
+             << L",\"frame\":" << s.frame() << L",\"event_seq\":" << s.last_event_seq(index);
+
+        json << L",\"foreground\":";
+        if (snapshot.exists) {
+            const std::int64_t frames = snapshot.nb_frames == std::numeric_limits<std::uint32_t>::max()
+                                            ? -1
+                                            : static_cast<std::int64_t>(snapshot.nb_frames);
+            json << L"{\"tag\":" << json_string(snapshot.foreground_tag)
+                 << L",\"producer\":" << json_string(snapshot.foreground_producer)
+                 << L",\"frame\":" << snapshot.frame_number << L",\"frames\":" << frames
+                 << L",\"paused\":" << (snapshot.paused ? L"true" : L"false")
+                 << L",\"starting\":" << (snapshot.starting ? L"true" : L"false") << L"}";
+        } else {
+            json << L"null";
+        }
+
+        json << L",\"waiting\":[";
+        for (std::size_t n = 0; n < snapshot.waiting.size(); ++n) {
+            const auto& item = snapshot.waiting[n];
+            json << (n > 0 ? L"," : L"") << L"{\"tag\":" << json_string(item.tag)
+                 << L",\"producer\":" << json_string(item.producer)
+                 << L",\"auto\":" << (item.auto_play ? L"true" : L"false") << L"}";
+        }
+        json << L"]}";
+
+        return L"201 QUEUE INFO OK\r\n" + json.str() + L"\r\n";
+    });
+}
 
 // EVENTS 1-10 [<seq>]: the layer's events after <seq>, oldest first, as one line of JSON.
 std::future<std::wstring> events_command(command_context& ctx)
@@ -1935,6 +2067,10 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_command(L"Query Commands", L"GL GC", gl_gc_command, 0);
 
     // PlayOut fork
+    repo->register_channel_command(L"PlayOut Commands", L"QUEUE", queue_command, 1);
+    repo->register_channel_command(L"PlayOut Commands", L"QUEUE CLEAR", queue_clear_command, 0);
+    repo->register_channel_command(L"PlayOut Commands", L"QUEUE REMOVE", queue_remove_command, 1);
+    repo->register_channel_command(L"PlayOut Commands", L"QUEUE INFO", queue_info_command, 0);
     repo->register_channel_command(L"PlayOut Commands", L"EVENTS", events_command, 0);
 
     repo->register_command(L"Query Commands", L"OSC SUBSCRIBE", osc_subscribe_command, 1);
