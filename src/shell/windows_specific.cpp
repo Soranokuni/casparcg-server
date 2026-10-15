@@ -156,6 +156,12 @@ void wait_for_keypress()
     std::system("pause");
 }
 
+bool stdin_is_console()
+{
+    DWORD mode = 0;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
+}
+
 std::shared_ptr<void> setup_debugging_environment()
 {
 #ifdef _DEBUG

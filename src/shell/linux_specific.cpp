@@ -26,6 +26,8 @@
 
 #include <iostream>
 
+#include <unistd.h>
+
 #include <X11/Xlib.h>
 
 namespace caspar {
@@ -61,6 +63,8 @@ void wait_for_keypress()
 {
     // TODO: implement if desirable.
 }
+
+bool stdin_is_console() { return isatty(STDIN_FILENO) != 0; }
 
 std::shared_ptr<void> setup_debugging_environment()
 {

@@ -126,6 +126,13 @@ auto run(const std::wstring& config_file_name, std::atomic<bool>& should_wait_fo
         while (true) {
 #ifdef WIN32
             if (!std::getline(std::wcin, wcmd)) { // TODO: It's blocking...
+                // PlayOut fork: without a console (a closed pipe, a file or no handle at all) every read
+                // fails at once, and retrying used a whole CPU core. Stop reading then, as Linux does
+                // (#1406). A console keeps retrying, so Ctrl+C does not end its input (8a98feaf).
+                if (!stdin_is_console()) {
+                    CASPAR_LOG(info) << L"Console input closed.";
+                    break;
+                }
                 std::wcin.clear();
                 continue;
             }
@@ -148,7 +155,8 @@ auto run(const std::wstring& config_file_name, std::atomic<bool>& should_wait_fo
                 if (boost::iequals(wcmd, L"EXIT") || boost::iequals(wcmd, L"Q") || boost::iequals(wcmd, L"QUIT") ||
                     boost::iequals(wcmd, L"BYE")) {
                     CASPAR_LOG(info) << L"Received message from Console: " << wcmd << L"\\r\\n";
-                    should_wait_for_keypress = true;
+                    // PlayOut fork: no "pause" without a console. It would open a console window and wait.
+                    should_wait_for_keypress = stdin_is_console();
                     shutdown(false); // false to not restart
                     break;
                 }

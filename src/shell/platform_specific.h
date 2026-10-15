@@ -30,6 +30,7 @@ void                  setup_prerequisites();
 void                  setup_console_window();
 void                  increase_process_priority();
 void                  wait_for_keypress();
+bool                  stdin_is_console();
 std::shared_ptr<void> setup_debugging_environment();
 void                  wait_for_remote_debugging();
 
