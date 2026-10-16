@@ -96,10 +96,11 @@ class OscWatch(threading.Thread):
                     self.latest[address] = args
                     m = EVENT_RE.match(address)
                     if m:
-                        seq, frame, time_ms, tag, reason = args
+                        seq, frame, time_ms, tag, reason = args[:5]
                         key = (int(m[1]), int(m[2]), seq)
+                        # A filler (FALLBACK LIST) adds its file name as a sixth argument.
                         self.events.setdefault(key, dict(seq=seq, frame=frame, time=time_ms, kind=m[3],
-                                                         tag=tag, reason=reason))
+                                                         tag=tag, reason=reason, file=args[5] if len(args) > 5 else None))
 
     def get(self, address):
         with self.lock:

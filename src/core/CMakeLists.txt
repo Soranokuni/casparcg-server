@@ -26,6 +26,7 @@ set(SOURCES
 
 		producer/cg_proxy.cpp
 		producer/frame_producer.cpp
+		producer/filler_list.cpp
 		producer/frame_producer_registry.cpp
 		producer/layer.cpp
 		producer/stage.cpp
@@ -66,6 +67,7 @@ set(HEADERS
 
 		producer/cg_proxy.h
 		producer/frame_producer.h
+		producer/filler_list.h
 		producer/frame_producer_registry.h
 		producer/layer.h
 		producer/layer_item.h

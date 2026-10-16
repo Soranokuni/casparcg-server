@@ -50,6 +50,7 @@
 #include <core/mixer/mixer.h>
 #include <core/producer/cg_proxy.h>
 #include <core/producer/color/color_producer.h>
+#include <core/producer/filler_list.h>
 #include <core/producer/frame_producer.h>
 #include <core/producer/frame_producer_registry.h>
 #include <core/producer/layer.h>
@@ -1955,10 +1956,15 @@ std::future<std::wstring> queue_info_command(command_context& ctx)
         }
         json << L"]";
 
-        json << L",\"fallback\":{\"set\":" << (fallback.producer != frame_producer::empty() ? L"true" : L"false")
-             << L",\"tag\":" << json_string(fallback.tag)
-             << L",\"active\":" << (snapshot.fallback_active ? L"true" : L"false")
-             << L",\"stall\":" << fallback.stall_limit << L"}}";
+        // "current": the file of the fallback on air (a filler, or the clip as given); null otherwise.
+        const auto current = !snapshot.fallback_active ? std::wstring()
+                             : fallback.list           ? snapshot.foreground_file
+                                                       : fallback.clip;
+        json << L",\"fallback\":{\"set\":" << (fallback.is_set() ? L"true" : L"false") << L",\"tag\":"
+             << json_string(fallback.tag) << L",\"active\":" << (snapshot.fallback_active ? L"true" : L"false")
+             << L",\"stall\":" << fallback.stall_limit << L",\"mode\":" << (fallback.list ? L"\"list\"" : L"\"clip\"")
+             << L",\"files\":" << (fallback.list ? fallback.list->size() : (fallback.is_set() ? 1 : 0))
+             << L",\"current\":" << (current.empty() ? L"null" : json_string(current)) << L"}}";
 
         return L"201 QUEUE INFO OK\r\n" + json.str() + L"\r\n";
     });
@@ -1987,8 +1993,11 @@ std::future<std::wstring> events_command(command_context& ctx)
 
             json << (first ? L"" : L",") << L"{\"seq\":" << event.seq << L",\"frame\":" << event.frame
                  << L",\"time\":" << event.time_ms << L",\"kind\":" << json_string(u16(event.kind))
-                 << L",\"tag\":" << json_string(event.tag) << L",\"reason\":" << json_string(u16(event.reason))
-                 << L"}";
+                 << L",\"tag\":" << json_string(event.tag) << L",\"reason\":" << json_string(u16(event.reason));
+            if (!event.file.empty()) {
+                json << L",\"file\":" << json_string(event.file);
+            }
+            json << L"}";
             first = false;
         }
         json << L"]}";
@@ -1998,6 +2007,7 @@ std::future<std::wstring> events_command(command_context& ctx)
 }
 
 // FALLBACK 1-10 <clip> [producer parameters] [TAG <tag>] [STALL <frames>]
+// <clip> is found as for PLAY: relative to the media folder, or an absolute path (D:/fallback/slate).
 std::future<std::wstring> fallback_command(command_context& ctx)
 {
     core::diagnostics::scoped_call_context save;
@@ -2015,16 +2025,105 @@ std::future<std::wstring> fallback_command(command_context& ctx)
     if (producer == frame_producer::empty())
         CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(ctx.parameters.at(0)));
 
-    const int index = ctx.layer_index();
+    const int  index = ctx.layer_index();
+    const auto clip  = ctx.parameters.at(0);
 
     return reply_from_stage(ctx, L"FALLBACK", [=](core::stage_sync_ops& s) -> std::wstring {
         auto config     = s.get_fallback(index);
         config.producer = producer;
+        config.clip     = clip;
+        config.list     = nullptr;
         config.tag      = tag.empty() ? L"fallback" : tag;
         if (stall_frames >= 0)
             config.stall_limit = stall_frames;
         s.set_fallback(index, config);
         return L"202 FALLBACK OK\r\n";
+    });
+}
+
+// The video files of a filler folder (not its sub-folders), sorted by name. Empty when the folder
+// cannot be read.
+std::vector<std::wstring> list_filler_files(const boost::filesystem::path& folder)
+{
+    static const std::set<std::wstring> video_exts = {
+        L".mov", L".mp4",  L".m4v", L".mxf", L".mkv", L".ts",  L".m2t", L".m2ts", L".mpg",   L".mpeg",
+        L".avi", L".webm", L".dv",  L".flv", L".ogv", L".nut", L".wmv", L".h264", L".dnxhd", L".prores"};
+
+    std::vector<std::wstring>             files;
+    boost::system::error_code             ec;
+    boost::filesystem::directory_iterator it(folder, ec);
+    for (; !ec && it != boost::filesystem::directory_iterator(); it.increment(ec)) {
+        boost::system::error_code type_ec;
+        if (!boost::filesystem::is_regular_file(it->status(type_ec)) || type_ec)
+            continue;
+        const auto ext = boost::to_lower_copy(it->path().extension().wstring());
+        if (video_exts.count(ext) == 0 || boost::starts_with(it->path().filename().wstring(), L"."))
+            continue;
+        files.push_back(it->path().wstring());
+    }
+    if (ec)
+        return {};
+
+    std::sort(files.begin(), files.end(), [](const std::wstring& a, const std::wstring& b) {
+        const auto name_a = boost::filesystem::path(a).filename().wstring();
+        const auto name_b = boost::filesystem::path(b).filename().wstring();
+        return boost::ilexicographical_compare(name_a, name_b) ||
+               (!boost::ilexicographical_compare(name_b, name_a) && name_a < name_b);
+    });
+    return files;
+}
+
+// FALLBACK 1-10 LIST <folder> [SHUFFLE] [NOREPEAT <n>] [TAG <tag>] [STALL <frames>]
+// The fallback becomes the folder's video files, one after the other. <folder> is absolute or
+// relative to the media folder. Replaces a FALLBACK <clip>, and is replaced by one.
+std::future<std::wstring> fallback_list_command(command_context& ctx)
+{
+    const auto tag          = take_tag(ctx.parameters, 1);
+    const auto stall        = take_param(L"STALL", ctx.parameters, 1);
+    const int  stall_frames = stall ? boost::lexical_cast<int>(*stall) : -1;
+    if (stall && stall_frames < 0)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"STALL must be 0 or more frames."));
+    const auto norepeat_param = take_param(L"NOREPEAT", ctx.parameters, 1);
+    const int  norepeat       = norepeat_param ? boost::lexical_cast<int>(*norepeat_param) : 3;
+    if (norepeat < 0)
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"NOREPEAT must be 0 or more."));
+    const bool shuffle = contains_param(L"SHUFFLE", ctx.parameters);
+
+    auto folder = boost::filesystem::path(ctx.parameters.at(0));
+    if (!folder.is_absolute())
+        folder = boost::filesystem::path(env::media_folder()) / folder;
+
+    auto files = list_filler_files(folder);
+    if (files.empty())
+        CASPAR_THROW_EXCEPTION(file_not_found() << msg_info(L"No video files in " + folder.wstring()));
+
+    // No channels in the dependencies: the list lives in the stage, and a filler is a file, never a route.
+    auto                                    channel = ctx.channel.raw_channel;
+    const core::frame_producer_dependencies dependencies(channel->frame_factory(),
+                                                         {},
+                                                         ctx.static_context->format_repository,
+                                                         channel->stage()->video_format_desc(),
+                                                         ctx.static_context->producer_registry,
+                                                         ctx.static_context->cg_registry);
+    const auto                              registry = ctx.static_context->producer_registry;
+    auto                                    list     = std::make_shared<core::filler_list>(
+        std::move(files), shuffle, norepeat, [dependencies, registry](const std::wstring& path) {
+            return registry->create_producer(dependencies, std::vector<std::wstring>{path});
+        });
+
+    const int index = ctx.layer_index();
+
+    return reply_from_stage(ctx, L"FALLBACK LIST", [=](core::stage_sync_ops& s) -> std::wstring {
+        auto config     = s.get_fallback(index);
+        config.producer = frame_producer::empty();
+        config.clip.clear();
+        config.list = list;
+        config.tag  = tag.empty() ? L"fallback" : tag;
+        if (stall_frames >= 0)
+            config.stall_limit = stall_frames;
+        s.set_fallback(index, config);
+        list->warm(); // the first filler is open before the queue runs dry
+        return L"202 FALLBACK LIST OK\r\n";
     });
 }
 
@@ -2036,6 +2135,8 @@ std::future<std::wstring> fallback_clear_command(command_context& ctx)
     return reply_from_stage(ctx, L"FALLBACK CLEAR", [=](core::stage_sync_ops& s) -> std::wstring {
         auto config     = s.get_fallback(index);
         config.producer = frame_producer::empty();
+        config.clip.clear();
+        config.list = nullptr;
         config.tag.clear();
         s.set_fallback(index, config);
         return L"202 FALLBACK CLEAR OK\r\n";
@@ -2289,6 +2390,7 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"PlayOut Commands", L"ONAIR", onair_command, 2);
     repo->register_channel_command(L"PlayOut Commands", L"FALLBACK", fallback_command, 1);
     repo->register_channel_command(L"PlayOut Commands", L"FALLBACK CLEAR", fallback_clear_command, 0);
+    repo->register_channel_command(L"PlayOut Commands", L"FALLBACK LIST", fallback_list_command, 1);
     repo->register_channel_command(L"PlayOut Commands", L"FALLBACK STALL", fallback_stall_command, 1);
     repo->register_channel_command(L"PlayOut Commands", L"EVENTS", events_command, 0);
 

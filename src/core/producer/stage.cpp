@@ -284,7 +284,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
 
         CASPAR_LOG(info) << L"[event] " << channel_index_ << L"-" << index << L" #" << event.seq << L" "
                          << u16(event.kind) << L" " << event.tag << L" (" << u16(event.reason) << L") frame "
-                         << event.frame;
+                         << event.frame << (event.file.empty() ? L"" : L" file " + event.file);
 
         log.history.push_back(std::move(event));
         while (log.history.size() > max_logged_events) {
@@ -327,8 +327,13 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             for (const auto* kind : kinds) {
                 for (auto it = log.history.rbegin(); it != log.history.rend(); ++it) {
                     if (it->kind == kind) {
-                        state["layer"][p.first]["event"][kind] = {
+                        monitor::vector_t args{
                             static_cast<std::int64_t>(it->seq), it->frame, it->time_ms, it->tag, it->reason};
+                        // FALLBACK LIST: the filler's file name, as a sixth argument.
+                        if (!it->file.empty()) {
+                            args.push_back(it->file);
+                        }
+                        state["layer"][p.first]["event"][kind] = std::move(args);
                         break;
                     }
                 }

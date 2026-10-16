@@ -58,14 +58,21 @@ struct item_info
 {
     std::wstring                  tag;
     std::shared_ptr<item_actions> actions;
+    std::wstring                  file; // a filler's file name, for the events (FALLBACK LIST)
 };
+
+class filler_list;
 
 // Fallback configuration of a layer index. Kept by the stage, so it survives CLEAR.
 struct fallback_config
 {
-    spl::shared_ptr<frame_producer> producer = frame_producer::empty();
+    spl::shared_ptr<frame_producer> producer = frame_producer::empty(); // FALLBACK <clip>
+    std::wstring                    clip;                               // the <clip> as given
+    std::shared_ptr<filler_list>    list;                               // FALLBACK LIST; replaces the clip
     std::wstring                    tag;
     int                             stall_limit = 0; // frames without a new frame before failover; 0 = off
+
+    bool is_set() const { return producer != frame_producer::empty() || list != nullptr; }
 };
 
 // One entry in a layer's event log.
@@ -77,6 +84,7 @@ struct layer_event
     std::string   kind;        // "onair", "offair", "ended", "stalled", "actionfailed"
     std::wstring  tag;
     std::string   reason; // "auto", "take", "stop", "clear", "error", "stall", "ended", ...
+    std::wstring  file;   // optional: the file of a filler (FALLBACK LIST)
 };
 
 // A read-only view of the items on a layer, for QUEUE INFO.
@@ -92,6 +100,7 @@ struct layer_snapshot
     bool                      exists = false;
     std::wstring              foreground_tag;
     std::wstring              foreground_producer;
+    std::wstring              foreground_file; // a filler's file name
     std::uint32_t             frame_number = 0;
     std::uint32_t             nb_frames    = std::numeric_limits<std::uint32_t>::max();
     bool                      paused       = false;

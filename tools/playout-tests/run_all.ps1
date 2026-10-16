@@ -1,4 +1,4 @@
-# Runs the PlayOut fork live tests: starts the built server with a test config, runs the three
+# Runs the PlayOut fork live tests: starts the built server with a test config, runs the four
 # check scripts, stops the server. Prints the summary line of each script and every failed check.
 #
 #   powershell -File tools\playout-tests\run_all.ps1 [-ExeDir build\shell\Release] [-PlayOutDir D:\PlayOut]
@@ -31,7 +31,7 @@ $server = Start-Process -FilePath (Join-Path $ExeDir 'casparcg.exe') -ArgumentLi
     -WorkingDirectory $ExeDir -WindowStyle Hidden -PassThru
 try {
     Start-Sleep -Seconds 7
-    foreach ($script in 'harness.py', 'extra.py', 'regress.py') {
+    foreach ($script in 'harness.py', 'extra.py', 'regress.py', 'fillers.py') {
         $log = Join-Path $here ($script -replace '\.py$', '.log')
         python -I (Join-Path $here $script) *> $log
         $summary = Select-String -Path $log -Pattern 'checks passed' | Select-Object -Last 1

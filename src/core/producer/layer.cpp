@@ -23,6 +23,7 @@
 
 #include "layer.h"
 
+#include "filler_list.h"
 #include "frame_producer.h"
 
 #include "../frame/draw_frame.h"
@@ -73,6 +74,7 @@ struct layer::impl
     std::deque<queued_item>                    queue_;
     fallback_config                            fallback_;
     bool                                       fallback_active_ = false;
+    bool                                       filler_stalled_  = false; // "stalled (fallback)" was reported
     bool                                       ended_reported_  = false;
     bool                                       fg_delivered_    = false; // the foreground has delivered a frame
     int                                        stall_count_     = 0;     // ticks without a new frame since then
@@ -86,6 +88,7 @@ struct layer::impl
     {
         bool         active = false;
         std::wstring visible_tag; // the item still on air
+        std::wstring visible_file;
         // Its producer: the layer shows its last frame while the new foreground is not on air.
         spl::shared_ptr<frame_producer> visible_producer = frame_producer::empty();
         std::shared_ptr<item_actions>   actions; // of the new foreground
@@ -99,7 +102,7 @@ struct layer::impl
     {
     }
 
-    void emit(const char* kind, const std::wstring& tag, const char* reason)
+    void emit(const char* kind, const std::wstring& tag, const std::string& reason, const std::wstring& file = {})
     {
         if (tag.empty())
             return;
@@ -108,6 +111,7 @@ struct layer::impl
         event.kind   = kind;
         event.tag    = tag;
         event.reason = reason;
+        event.file   = file;
         events_.push_back(std::move(event));
     }
 
@@ -119,6 +123,7 @@ struct layer::impl
         // actions do not run.
         if (!switch_.active) {
             switch_.visible_tag      = foreground_info_.tag;
+            switch_.visible_file     = foreground_info_.file;
             switch_.visible_producer = foreground_;
         }
 
@@ -139,6 +144,7 @@ struct layer::impl
 
     // The tag of the item the viewer sees.
     const std::wstring& visible_tag() const { return switch_.active ? switch_.visible_tag : foreground_info_.tag; }
+    const std::wstring& visible_file() const { return switch_.active ? switch_.visible_file : foreground_info_.file; }
 
     void report_switch()
     {
@@ -157,8 +163,8 @@ struct layer::impl
             return;
         }
 
-        emit("offair", switch_.visible_tag, switch_.reason);
-        emit("onair", foreground_info_.tag, switch_.reason);
+        emit("offair", switch_.visible_tag, switch_.reason, switch_.visible_file);
+        emit("onair", foreground_info_.tag, switch_.reason, foreground_info_.file);
 
         if (switch_.actions) {
             pending_actions_.push_back(std::move(switch_.actions));
@@ -261,7 +267,7 @@ struct layer::impl
 
     void stop(const char* reason)
     {
-        emit("offair", visible_tag(), reason);
+        emit("offair", visible_tag(), reason, visible_file());
         switch_ = {};
 
         foreground_      = frame_producer::empty();
@@ -273,18 +279,48 @@ struct layer::impl
         stall_count_     = 0;
     }
 
+    // Puts the fallback on air. With a filler list it also moves on to the next filler; with a single
+    // clip it does nothing while that clip is on air.
     bool activate_fallback(const char* reason)
     {
+        if (fallback_.list) {
+            return next_filler(reason);
+        }
+
         if (fallback_.producer == frame_producer::empty())
             return false;
 
-        if (!fallback_active_) {
+        if (!fallback_active_ || foreground_ != fallback_.producer) {
             CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" replaced by fallback "
                                 << fallback_.producer->print() << L" (" << reason << L").";
             set_foreground(fallback_.producer, item_info{fallback_.tag, nullptr}, reason);
             fallback_active_ = true;
             paused_          = false;
         }
+        return true;
+    }
+
+    // FALLBACK LIST: the next filler goes on air, if its producer is open. Otherwise the layer keeps
+    // its last frame and this is tried again on the next tick.
+    bool next_filler(const char* reason)
+    {
+        auto pick = fallback_.list->take();
+        if (!pick) {
+            if (fallback_.list->exhausted() && !filler_stalled_) {
+                filler_stalled_ = true;
+                CASPAR_LOG(warning) << L"[layer] No filler could be opened. Holding the last frame.";
+                emit("stalled", fallback_.tag, "fallback");
+            }
+            return false;
+        }
+
+        CASPAR_LOG(info) << L"[layer] " << foreground_->print() << L" replaced by filler " << pick->file << L" ("
+                         << reason << L").";
+        filler_stalled_ = false;
+        set_foreground(
+            pick->producer, item_info{fallback_.tag + L":" + std::to_wstring(pick->n), nullptr, pick->file}, reason);
+        fallback_active_ = true;
+        paused_          = false;
         return true;
     }
 
@@ -310,6 +346,12 @@ struct layer::impl
 
             play_if_auto_ready();
 
+            if (fallback_.list) {
+                for (const auto& failure : fallback_.list->take_failures()) {
+                    emit("actionfailed", fallback_.tag, failure.reason, failure.file);
+                }
+            }
+
             // An empty foreground (nothing played yet, or after STOP) never counts as ended: a
             // LOADBG or QUEUE into an empty layer must not bring up the fallback.
             const auto nb_frames = foreground_->nb_frames();
@@ -318,7 +360,7 @@ struct layer::impl
                 static_cast<std::int64_t>(foreground_->frame_number()) + 1 >= static_cast<std::int64_t>(nb_frames);
             if (ended && !ended_reported_) {
                 ended_reported_ = true;
-                emit("ended", foreground_info_.tag, "ended");
+                emit("ended", foreground_info_.tag, "ended", foreground_info_.file);
             }
 
             frames_left_ = 0;
@@ -339,6 +381,9 @@ struct layer::impl
             if (!played && !paused_) {
                 if (ended && !fallback_active_) {
                     activate_fallback("ended");
+                } else if (ended && (fallback_.list || foreground_ != fallback_.producer)) {
+                    // The next filler. Also a filler or an old clip that ends after FALLBACK changed.
+                    activate_fallback("auto");
                 } else if (fallback_.stall_limit > 0 && stall_count_ >= fallback_.stall_limit) {
                     CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" delivered no frame for "
                                         << stall_count_ << L" frames.";
@@ -390,7 +435,7 @@ struct layer::impl
             }
             state_["queue"]["tags"] = tags;
         }
-        if (fallback_.producer != frame_producer::empty()) {
+        if (fallback_.is_set()) {
             state_["fallback"]["tag"]    = fallback_.tag;
             state_["fallback"]["active"] = fallback_active_;
         }
@@ -558,6 +603,7 @@ struct layer::impl
         result.exists              = true;
         result.foreground_tag      = foreground_info_.tag;
         result.foreground_producer = foreground_->name();
+        result.foreground_file     = foreground_info_.file;
         result.frame_number        = foreground_->frame_number();
         result.nb_frames           = foreground_->nb_frames();
         result.paused              = paused_;
@@ -624,8 +670,15 @@ layer::attach_result layer::attach_actions(const std::wstring& tag, const std::s
 {
     return impl_->attach_actions(tag, actions);
 }
-void layer::set_fallback(const fallback_config& config) { impl_->fallback_ = config; }
-void layer::on_clear() { impl_->emit("offair", impl_->visible_tag(), "clear"); }
+void layer::set_fallback(const fallback_config& config)
+{
+    impl_->fallback_       = config;
+    impl_->filler_stalled_ = false;
+    if (config.list) {
+        config.list->warm();
+    }
+}
+void layer::on_clear() { impl_->emit("offair", impl_->visible_tag(), "clear", impl_->visible_file()); }
 std::vector<layer_event> layer::take_events()
 {
     auto events = std::move(impl_->events_);

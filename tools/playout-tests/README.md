@@ -9,7 +9,7 @@ powershell -File tools\playout-tests\run_all.ps1 [-ExeDir build\shell\Release] [
 
 `run_all.ps1` writes `casparcg.config` from the template, makes the test media once, copies PlayOut's
 advisory template, starts the server hidden on AMCP port 5260 / OSC port 6260, runs `harness.py`,
-`extra.py` and `regress.py`, and stops the server. Each script writes a `.log` next to it.
+`extra.py`, `regress.py` and `fillers.py` (absolute fallback, F2, `FALLBACK LIST`), and stops the server. Each script writes a `.log` next to it.
 
 Other tools:
 
