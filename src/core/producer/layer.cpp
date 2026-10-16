@@ -84,11 +84,13 @@ struct layer::impl
     // waits for its decoder), the transition keeps showing the old item, which stays on air.
     struct pending_switch
     {
-        bool                          active = false;
-        std::wstring                  visible_tag; // the item still on air
-        std::shared_ptr<item_actions> actions;     // of the new foreground
-        const char*                   reason = "";
-        int                           waited = 0; // ticks without the new foreground being ready
+        bool         active = false;
+        std::wstring visible_tag; // the item still on air
+        // Its producer: the layer shows its last frame while the new foreground is not on air.
+        spl::shared_ptr<frame_producer> visible_producer = frame_producer::empty();
+        std::shared_ptr<item_actions>   actions; // of the new foreground
+        const char*                     reason = "";
+        int                             waited = 0; // ticks without the new foreground being ready
     } switch_;
 
   public:
@@ -116,7 +118,8 @@ struct layer::impl
         // An item replaced before it showed a frame never went on air: it gets no events and its
         // actions do not run.
         if (!switch_.active) {
-            switch_.visible_tag = foreground_info_.tag;
+            switch_.visible_tag      = foreground_info_.tag;
+            switch_.visible_producer = foreground_;
         }
 
         foreground_      = std::move(producer);
@@ -247,6 +250,9 @@ struct layer::impl
             auto_play_       = false;
 
             set_foreground(std::move(producer), std::move(info), reason);
+            if (!lead) {
+                switch_.visible_producer = frame_producer::empty(); // failed: never pulled again
+            }
             promote_queue();
         }
 
@@ -304,10 +310,12 @@ struct layer::impl
 
             play_if_auto_ready();
 
+            // An empty foreground (nothing played yet, or after STOP) never counts as ended: a
+            // LOADBG or QUEUE into an empty layer must not bring up the fallback.
             const auto nb_frames = foreground_->nb_frames();
-            const bool ended     = nb_frames != std::numeric_limits<std::uint32_t>::max() &&
-                               static_cast<std::int64_t>(foreground_->frame_number()) + 1 >=
-                                   static_cast<std::int64_t>(nb_frames);
+            const bool ended =
+                foreground_ != frame_producer::empty() && nb_frames != std::numeric_limits<std::uint32_t>::max() &&
+                static_cast<std::int64_t>(foreground_->frame_number()) + 1 >= static_cast<std::int64_t>(nb_frames);
             if (ended && !ended_reported_) {
                 ended_reported_ = true;
                 emit("ended", foreground_info_.tag, "ended");
@@ -403,8 +411,11 @@ struct layer::impl
                 }
             }
 
+            // PlayOut fork: a new foreground that was not ready in prepare() is not on air on this tick.
+            // Its transition's last_frame() polls the decoder again and can show the first frame now,
+            // which then shows a second time on the next tick: keep the item on air instead.
             if (!frame) {
-                frame = foreground_->last_frame(field);
+                frame = switch_.active ? switch_.visible_producer->last_frame(field) : foreground_->last_frame(field);
             }
 
             update_state();
