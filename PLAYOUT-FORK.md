@@ -13,6 +13,8 @@ the engine state from OSC file paths and positions. Everything else stays stock 
 - This change set: TAG, QUEUE, ONAIR, FALLBACK/STALL, EVENTS, a fix for an upstream bug (§7) and a
   console input fix (§6).
 - `520596b2` — merge of `origin/v2.5.x`: upstream's fixes after v2.5.1.
+- Branch `playout/fallback-list` (2026-10-16): absolute fallback paths, no fallback flash on a take into
+  an empty layer, and `FALLBACK LIST` (fillers that play when the queue runs dry).
 - Target: x64 broadcast PCs. Development and build: Windows 11 on ARM64 (see §2).
 
 Contents
@@ -39,7 +41,7 @@ Contents
 | **Event log** | `onair`, `offair`, `ended`, `stalled`, `actionfailed` per item, stamped with the channel frame number and the wall clock. | `EVENTS`, OSC `…/event/*` |
 | **Wait queue** | The engine holds the next N items. It plays them back to back itself, so the channel keeps running when PlayOut is slow, busy or dead. | `QUEUE`, `QUEUE CLEAR`, `QUEUE REMOVE`, `QUEUE INFO` |
 | **On-air actions** | Commands attached to an item run when the item goes on air. Stage commands (rating, TP, clears, mixer) show on the item's first frame. | `ONAIR <tag> <command>` |
-| **Fallback and stall failover** | When the queue runs dry, a decoder stalls or a producer fails, the layer switches to the next item or to a warm emergency clip, instead of freezing or going black. | `FALLBACK`, `FALLBACK CLEAR`, `FALLBACK STALL` |
+| **Fallback and stall failover** | When the queue runs dry, a decoder stalls or a producer fails, the layer switches to the next item, to a warm emergency clip or to a folder of fillers, instead of freezing or going black. | `FALLBACK`, `FALLBACK LIST`, `FALLBACK CLEAR`, `FALLBACK STALL` |
 | **Optimistic concurrency** | Queue edits carry `EXPECT <tag on air>`. The engine refuses a stale edit with `409`, so a rundown edit can never race the cut. | `EXPECT <tag>` |
 | **Bug fix** | `PLAY … SEEK n` followed by `LOADBG … AUTO` no longer skips the clip (§7). | — |
 
@@ -158,7 +160,9 @@ take that has not shown its first frame yet, the command waits for that frame (`
 
 ### 3.5 Fallback and failover
 
-`FALLBACK 1-10 <clip> LOOP` creates a producer once and keeps it warm. It goes on air in these cases:
+`FALLBACK 1-10 <clip> LOOP` creates a producer once and keeps it warm. `FALLBACK 1-10 LIST <folder>`
+plays the video files of a folder instead, one after the other (fillers, below). The fallback goes on
+air in these cases:
 
 | Case | What happens | Event |
 |---|---|---|
@@ -170,10 +174,53 @@ take that has not shown its first frame yet, the command waits for that frame (`
 - While the fallback is on air, an AUTO item (`QUEUE … AUTO`, `LOADBG … AUTO`) replaces it on the
   next frame. `PLAY` also replaces it.
 - `STOP` and `CLEAR` never start the fallback: they are explicit operator actions.
+- An **empty** foreground never counts as ended. `LOADBG` or `QUEUE` (without `AUTO`) into an empty
+  layer leaves it empty until the take: the fallback does not flash up for the frames before `PLAY`.
+  (Before 2026-10-16 the empty layer counted as "ended" and the fallback aired for 1–2 frames on every
+  first take after a stop or a start, logged as `empty replaced by fallback`.)
 - The configuration belongs to the layer index. It survives `CLEAR`. A video-mode change removes it.
 - Use `LOOP` for a clip fallback. A fallback that ends freezes on its last frame.
+- `<clip>` is found as for `PLAY`: relative to the media folder, or an **absolute path**
+  (`D:/fallback/slate`, with or without the extension; UNC paths work too). The ffmpeg and image
+  producers of 2.5.1 already try the name as an absolute path first, then under the media folder. In
+  AMCP write `/` (or `\\`): a single `\` inside quotes is an escape character. Keep the fallback on a
+  local disk, so a share outage cannot take it out with the media.
 - `STALL` is counted in ticks (25 per second on a 1080i50 channel). `0` turns stall detection off.
   The stall check works without a fallback clip too: then a stall skips to the AUTO background.
+
+#### Fillers (`FALLBACK LIST`)
+
+`FALLBACK 1-10 LIST <folder>` makes the fallback a list of files: the video files of `<folder>`
+(not its sub-folders, sorted by name, case-insensitive; files starting with `.` are skipped).
+
+- `<folder>` is absolute (`D:/fillers`) or relative to the media folder.
+- In order by default. `SHUFFLE` picks at random; `NOREPEAT <n>` keeps a file from coming back within
+  `n` picks (default 3, at most the number of files − 1). Without `SHUFFLE` the order already has no
+  repeats.
+- The engine keeps the **next** filler open while one plays. It is opened on a worker thread and
+  offered only once its first frame is decoded, so the cut from one filler to the next is gapless
+  (the next filler shows on the frame after the last frame of the one before), and a slow open never
+  blocks a tick. The first filler is opened when `FALLBACK LIST` arrives, so it is ready before the
+  queue runs dry.
+- A file that fails to open, or does not deliver a first frame within 1 s, is skipped: event
+  `actionfailed` (tag = the fallback tag, reason `FALLBACK LIST 404` when no producer accepts it,
+  `FALLBACK LIST 500` when it opens but fails or decodes nothing; `file` = the file name), and the next
+  file is tried at once. This happens while the filler before it plays, so the skip has no gap when
+  that filler is longer than about 1 s. ffmpeg accepts an unreadable `.mov` and fails inside its own
+  thread, so most broken files are found by the 1 s limit. When every file fails, the layer holds its
+  last frame and reports `stalled (fallback)` once; the folder is tried again every 5 s.
+- Each filler goes on air as its own item, tagged `<tag>:<n>`, where `<n>` counts the fillers aired
+  since the list was set (`fallback:1`, `fallback:2`, …). Its events carry the file name in the field
+  `file`. The first filler comes on air with the reason of the failover (`ended`, `stall`, `error`);
+  between two fillers the events are `ended fallback:<n>`, `offair fallback:<n> (auto)`,
+  `onair fallback:<n+1> (auto)`, all on one tick.
+- An AUTO item (`QUEUE … AUTO`, `LOADBG … AUTO`) or `PLAY` replaces the running filler on the next
+  frame, as with a single clip. When that item ends with nothing behind it, the fillers come back.
+- A stalled filler is replaced by the next filler.
+- `LIST` replaces a single-clip fallback and the other way round. The filler on air plays to its end;
+  then the new fallback follows. `FALLBACK CLEAR` removes the list; the filler on air plays to its end
+  and its last frame holds.
+- The files are listed when the command arrives. Run `FALLBACK LIST` again after changing the folder.
 
 ### 3.6 Events
 
@@ -189,8 +236,8 @@ to the CasparCG log at info level, for example:
 | `onair` | The item shows its first frame on this tick. | `auto`, `take`, `ended`, `stall`, `error` (how it came on air) |
 | `offair` | The item stops being on air on this tick. | `auto`, `take`, `stop`, `clear`, `ended`, `stall`, `error` |
 | `ended` | The item showed its last frame on the tick before. | `ended` |
-| `stalled` | The item delivered no frame for `STALL` ticks, or did not start. | `stall`, `start` |
-| `actionfailed` | A deferred on-air command failed. | the command and its code, for example `CG ADD 404` |
+| `stalled` | The item delivered no frame for `STALL` ticks, or did not start; or no filler could be opened. | `stall`, `start`, `fallback` |
+| `actionfailed` | A deferred on-air command failed, or a filler could not be opened. | the command and its code, for example `CG ADD 404`, `FALLBACK LIST 404` |
 
 `seq` counts per layer index and starts at 1 after each server start. `instance` (in `EVENTS` and
 `QUEUE INFO`) is the server start time in ms. A new `instance` means the server restarted and the
@@ -248,13 +295,17 @@ Reply `201 QUEUE INFO OK` and one line of JSON:
 {"channel":1,"layer":10,"instance":1792065829887,"frame":553,"event_seq":14,
  "foreground":{"tag":"a","producer":"ffmpeg","frame":5,"frames":50,"paused":false,"starting":false},
  "waiting":[{"tag":"b","producer":"transition","auto":true},{"tag":"c","producer":"transition","auto":true}],
- "fallback":{"set":true,"tag":"slate","active":false,"stall":50}}
+ "fallback":{"set":true,"tag":"slate","active":false,"stall":50,"mode":"clip","files":1,"current":null}}
 ```
 
 - `foreground` is `null` when the layer does not exist. `frames` is `-1` for an endless producer.
   `frame` and `frames` count fields on an interlaced channel, as `SEEK` and `LENGTH` do.
 - `starting` is `true` for a take that has not shown its first frame yet.
 - `waiting` lists the background first, then the queue.
+- `fallback.mode` is `"list"` after `FALLBACK LIST`, else `"clip"`. `files` is the number of files in
+  the list (1 for a clip, 0 when no fallback is set). `current` is the file on air while the fallback
+  is active: the filler's file name, or the `<clip>` as given; `null` otherwise. With fillers,
+  `foreground.tag` is `<tag>:<n>`.
 
 **EXPECT.** `EXPECT <tag>` runs the command only when `<tag>` is the layer's foreground (the
 logical one: a starting take counts). `EXPECT -` means "no tagged item on air". The check runs on
@@ -288,11 +339,24 @@ Replies:
 
 ```
 FALLBACK 1-10 <clip> [parameters, for example LOOP] [TAG <tag>] [STALL <ticks>]
-FALLBACK 1-10 CLEAR          (removes the clip; the STALL limit stays)
+FALLBACK 1-10 LIST <folder> [SHUFFLE] [NOREPEAT <n>] [TAG <tag>] [STALL <ticks>]
+FALLBACK 1-10 CLEAR          (removes the clip or the list; the STALL limit stays)
 FALLBACK 1-10 STALL <ticks>  (0 = off)
 ```
 
-The default tag of the fallback is `fallback`. Replies: `202`, `404` (file not found), `403`.
+`<clip>` and `<folder>` may be absolute paths (§3.5). The default tag of the fallback is `fallback`.
+
+| Command | Replies |
+|---|---|
+| `FALLBACK <clip>` | `202 FALLBACK OK`, `404 FALLBACK FAILED` (file not found), `403` (bad parameter) |
+| `FALLBACK LIST` | `202 FALLBACK LIST OK`, `404 FALLBACK LIST FAILED` (no such folder, or no video file in it), `403` (bad `STALL`/`NOREPEAT`/`TAG`) |
+
+Examples:
+
+```
+FALLBACK 1-10 "D:/playout/fallback/slate" LOOP TAG fallback STALL 50
+FALLBACK 1-10 LIST "D:/playout/fillers" SHUFFLE TAG fallback STALL 50
+```
 
 ### 4.5 EVENTS
 
@@ -311,6 +375,13 @@ it), oldest first:
 
 When `<seq>` is lower than `oldest - 1`, events were lost from the log (more than 128 since).
 
+Events of a filler (and `actionfailed` of a filler that could not be opened) have one more field,
+`"file"`, the file name without the folder:
+
+```json
+{"seq":31,"frame":1930,"time":1792147563096,"kind":"onair","tag":"fallback:2","reason":"auto","file":"f2.mov"}
+```
+
 ---
 
 ## 5. OSC reference
@@ -325,7 +396,7 @@ New addresses. They appear only on layers that use the features.
 | `/channel/N/stage/layer/L/queue/tags` | string… | Items wait behind the background. |
 | `/channel/N/stage/layer/L/fallback/tag`, `…/fallback/active` | string, bool | A fallback is set. |
 | `/channel/N/stage/layer/L/event/seq` | int64 | The layer has events: the last `seq`. |
-| `/channel/N/stage/layer/L/event/<kind>` | int64 seq, int64 frame, int64 time_ms, string tag, string reason | The latest event of each kind. |
+| `/channel/N/stage/layer/L/event/<kind>` | int64 seq, int64 frame, int64 time_ms, string tag, string reason[, string file] | The latest event of each kind. The sixth argument is there only on filler events (§3.5). |
 
 The OSC sender sends the latest state only: when it is slower than the channel, it drops states.
 For that reason the latest event of each kind is sent again on every tick ("latched"). A lost or
@@ -345,6 +416,13 @@ dropped packet delays an event; it never loses it. A client should:
 - **AUTO, end and failover checks run once per tick, before any layer is drawn** (stock: inside the
   draw of the first field). The timing is the same: the checks used the same values in both places.
 - **`CLEAR` keeps the event log and the fallback configuration** of the layer index.
+- **A take shows its first frame once.** While a new foreground is not ready (it was not ready when
+  the tick began), the layer shows the last frame of the item still on air. Stock CasparCG asks the
+  transition for its `last_frame()`, which polls the decoder again mid-tick and could show the new
+  item's first frame one tick early; the next tick then showed it again, so the item ran one frame
+  long. This upstream race was rare while an empty layer flashed the fallback (the slate gave the
+  transition a frame to show); the F2 fix (§3.5) made it common on takes into an empty layer
+  (live tests: 1 in 15 runs on the old build, 5 in 15 with F2 alone, 0 in 8 with both).
 - **New log lines** at info level: `[event] …`, and warnings for stalls and failovers.
 - **ffmpeg `frame_number()`** never wraps before the first frame (§7).
 - **Console input on Windows.** When stdin is not a console (a closed pipe, a file, no handle) and a
@@ -535,11 +613,13 @@ frame, which graphics.
 |---|---|---|
 | `harness.py` | 112 | Progressive 50p channel: TAG, QUEUE with SEEK/LENGTH, every queued item starts on its event frame and plays each source frame once, on-air actions on the first frame of b and c, `ONAIR RAN`, the take recipe, EXPECT `409`, REMOVE, unknown tag `404`, refused commands `403`, fallback after the last item, fallback yields to AUTO, the §7 fix (q − p = 40 frames), CLEAR events, EVENTS since, OSC latch. Interlaced PAL channel: queue with LENGTH/SEEK in fields, field-exact. **1080i5000 channel** (the broadcast format): queue, on-air actions on the item's first field, fallback on the field after the last one, the §7 fix. |
 | `extra.py` | 31 | `BEGIN`/`COMMIT` with QUEUE and ONAIR, PLAY drops the queue, `CLEAR AFTER`, decoder stall over HTTP: 1.2 s of stream, 25 ticks without frames, then `stalled`, `offair (stall)`, `onair slate (stall)`. `ONAIR … PLAY 1-20 DECKLINK 1` is accepted without opening a device and runs after the cut (it fails there: the laptop has no card). |
+| `fillers.py` | 82 | Absolute fallback path outside the media folder (with and without extension, missing → 404, QUEUE INFO `current`). F2: `LOADBG` + `PLAY` into an empty layer with a fallback set gives no fallback event and no `empty replaced by fallback` log line; `QUEUE` without AUTO and `STOP` start no fallback; a real item that ends still falls back on the same tick. `FALLBACK LIST`: empty or missing folder → 404, rotation in name order with counted tags and `file`, `ended`/`offair (auto)`/`onair (auto)` on one tick 20 frames apart, recording checked frame by frame (each filler shows its 20 frames once, gapless after the item before), AUTO and PLAY replace a filler, fillers return after the AUTO item, a broken file skipped without a gap and reported as `actionfailed`, all files broken → `stalled (fallback)`, `SHUFFLE NOREPEAT 2`, LIST and clip replace each other, QUEUE INFO `mode`/`files`/`current`, OSC sixth argument. |
 | `regress.py` | 22 | Untagged use shows no new OSC addresses; every new OSC address; `INFO` carries tags; a real `CG ADD` of PlayOut's `playout/advisory.html` as a deferred on-air action. |
 | `stdin_cpu.ps1` | — | Idle CPU with stdin at end-of-file against a console stdin. |
 | `stdin_exit.py` | — | Starts the server as PlayOut does (no window, piped stdin): idle CPU with the pipe open, graceful `EXIT`, idle CPU after the pipe closes. Run it on the fork and on stock. |
 
 Result on the laptop (x64 under emulation), 2026-10-15: **165 of 165 checks pass**.
+2026-10-16, branch `playout/fallback-list`: the 165 plus `fillers.py` (82): **247 of 247**.
 
 `stdin_exit.py` on the laptop:
 
@@ -568,6 +648,9 @@ Notes:
 - **CG on-air commands are not frame-exact** (§3.4).
 - **`SWAP`** moves layers without events. A swapped layer keeps its fallback setting, the index does not.
 - **Tags must be unique per layer** for exact results (§3.1).
+- **Fillers hold one extra open decoder** (the next filler). A filler file that is replaced on disk
+  while the list is set is opened by name at its turn; a file added to the folder needs a new
+  `FALLBACK LIST`.
 - **Long soak test not done.** The 165 checks run for about two minutes. Each queued item holds an
   open decoder, and the engine does not limit the queue depth yet.
 - **Upstream fixes after v2.5.1 are merged** (`origin/v2.5.x`, merge `520596b2`: CEF crashes, the
@@ -582,9 +665,10 @@ Notes:
 | File | Change |
 |---|---|
 | `src/core/producer/layer_item.h` | New: `item_info`, `item_actions`, `fallback_config`, `layer_event`, `layer_snapshot`. |
+| `src/core/producer/filler_list.h`, `filler_list.cpp` | New: the filler list of `FALLBACK LIST` (order, shuffle, NOREPEAT, the warm next producer on a worker thread, failures). |
 | `src/core/producer/layer.h`, `layer.cpp` | Tags, the queue, `prepare()` (AUTO, end, stall, fallback, visible switch), events, attach of actions. |
 | `src/core/producer/stage.h`, `stage.cpp` | The tick runs `prepare_layers()` before drawing and applies on-air actions there; per-index event log and fallback configuration; `stage_sync_ops`, `invoke_sync()`, `stage_capture`. |
-| `src/protocol/amcp/AMCPCommandsImpl.cpp` | `TAG` on `PLAY`/`LOAD`/`LOADBG`; `QUEUE*`, `ONAIR`, `FALLBACK*`, `EVENTS`; JSON replies. |
+| `src/protocol/amcp/AMCPCommandsImpl.cpp` | `TAG` on `PLAY`/`LOAD`/`LOADBG`; `QUEUE*`, `ONAIR`, `FALLBACK*` (with `FALLBACK LIST`), `EVENTS`; JSON replies. |
 | `src/protocol/amcp/amcp_command_context.h` | The executor for deferred on-air commands. |
 | `src/protocol/amcp/AMCPCommand.h` | `layer_index()` accessor. |
 | `src/modules/ffmpeg/producer/ffmpeg_producer.cpp` | The §7 fix. |
