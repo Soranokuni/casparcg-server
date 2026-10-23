@@ -300,18 +300,32 @@ struct layer::impl
         return true;
     }
 
-    // FALLBACK LIST: the next filler goes on air, if its producer is open. Otherwise the layer keeps
-    // its last frame and this is tried again on the next tick.
+    // FALLBACK LIST: the next filler goes on air, if its producer is open. Otherwise this is tried
+    // again on the next tick. When every filler failed, the single clip set before the list (the
+    // slate) goes on air if there is one; without it the layer keeps its last frame.
     bool next_filler(const char* reason)
     {
         auto pick = fallback_.list->take();
         if (!pick) {
-            if (fallback_.list->exhausted() && !filler_stalled_) {
-                filler_stalled_ = true;
-                CASPAR_LOG(warning) << L"[layer] No filler could be opened. Holding the last frame.";
-                emit("stalled", fallback_.tag, "fallback");
+            if (!fallback_.list->exhausted()) {
+                return false;
             }
-            return false;
+            const bool has_slate = fallback_.producer != frame_producer::empty();
+            if (!filler_stalled_) {
+                filler_stalled_ = true;
+                CASPAR_LOG(warning) << L"[layer] No filler could be opened. "
+                                    << (has_slate ? L"Airing the slate." : L"Holding the last frame.");
+                emit("stalled", fallback_.tag, has_slate ? "fallback slate" : "fallback");
+            }
+            if (!has_slate) {
+                return false;
+            }
+            if (!fallback_active_ || foreground_ != fallback_.producer) {
+                set_foreground(fallback_.producer, item_info{fallback_.tag, nullptr}, reason);
+                fallback_active_ = true;
+                paused_          = false;
+            }
+            return true;
         }
 
         CASPAR_LOG(info) << L"[layer] " << foreground_->print() << L" replaced by filler " << pick->file << L" ("
@@ -383,6 +397,11 @@ struct layer::impl
                     activate_fallback("ended");
                 } else if (ended && (fallback_.list || foreground_ != fallback_.producer)) {
                     // The next filler. Also a filler or an old clip that ends after FALLBACK changed.
+                    activate_fallback("auto");
+                } else if (fallback_active_ && fallback_.list && foreground_ == fallback_.producer &&
+                           fallback_.producer != frame_producer::empty()) {
+                    // The slate is on air because every filler failed: back to the fillers as soon
+                    // as one opens again (the list retries the folder every few seconds).
                     activate_fallback("auto");
                 } else if (fallback_.stall_limit > 0 && stall_count_ >= fallback_.stall_limit) {
                     CASPAR_LOG(warning) << L"[layer] " << foreground_->print() << L" delivered no frame for "

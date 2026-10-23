@@ -1957,14 +1957,17 @@ std::future<std::wstring> queue_info_command(command_context& ctx)
         json << L"]";
 
         // "current": the file of the fallback on air (a filler, or the clip as given); null otherwise.
-        const auto current = !snapshot.fallback_active ? std::wstring()
-                             : fallback.list           ? snapshot.foreground_file
-                                                       : fallback.clip;
+        // With a list, an empty foreground file means the slate is on air.
+        const auto current = !snapshot.fallback_active                           ? std::wstring()
+                             : fallback.list && !snapshot.foreground_file.empty() ? snapshot.foreground_file
+                                                                                   : fallback.clip;
         json << L",\"fallback\":{\"set\":" << (fallback.is_set() ? L"true" : L"false") << L",\"tag\":"
              << json_string(fallback.tag) << L",\"active\":" << (snapshot.fallback_active ? L"true" : L"false")
              << L",\"stall\":" << fallback.stall_limit << L",\"mode\":" << (fallback.list ? L"\"list\"" : L"\"clip\"")
              << L",\"files\":" << (fallback.list ? fallback.list->size() : (fallback.is_set() ? 1 : 0))
-             << L",\"current\":" << (current.empty() ? L"null" : json_string(current)) << L"}}";
+             << L",\"current\":" << (current.empty() ? L"null" : json_string(current))
+             << L",\"slate\":" << (fallback.list && !fallback.clip.empty() ? json_string(fallback.clip) : L"null")
+             << L"}}";
 
         return L"201 QUEUE INFO OK\r\n" + json.str() + L"\r\n";
     });
@@ -2075,7 +2078,8 @@ std::vector<std::wstring> list_filler_files(const boost::filesystem::path& folde
 
 // FALLBACK 1-10 LIST <folder> [SHUFFLE] [NOREPEAT <n>] [TAG <tag>] [STALL <frames>]
 // The fallback becomes the folder's video files, one after the other. <folder> is absolute or
-// relative to the media folder. Replaces a FALLBACK <clip>, and is replaced by one.
+// relative to the media folder. A FALLBACK <clip> set before stays as the slate, aired when every
+// filler fails. A later FALLBACK <clip> replaces the list.
 std::future<std::wstring> fallback_list_command(command_context& ctx)
 {
     const auto tag          = take_tag(ctx.parameters, 1);
@@ -2114,10 +2118,8 @@ std::future<std::wstring> fallback_list_command(command_context& ctx)
     const int index = ctx.layer_index();
 
     return reply_from_stage(ctx, L"FALLBACK LIST", [=](core::stage_sync_ops& s) -> std::wstring {
-        auto config     = s.get_fallback(index);
-        config.producer = frame_producer::empty();
-        config.clip.clear();
-        config.list = list;
+        auto config = s.get_fallback(index);
+        config.list = list; // the clip, if any, stays as the slate
         config.tag  = tag.empty() ? L"fallback" : tag;
         if (stall_frames >= 0)
             config.stall_limit = stall_frames;

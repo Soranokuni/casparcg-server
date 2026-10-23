@@ -279,6 +279,7 @@ def scenario_broken(amcp, osc):
     expect(amcp, "CLEAR 1-10", 202, "CLEAR after the broken list")
 
     seq = last_seq(amcp)
+    expect(amcp, "FALLBACK 1-10 CLEAR", 202, "FALLBACK CLEAR before the dead list (no slate)")
     expect(amcp, 'FALLBACK 1-10 LIST "fillers_dead" TAG dead', 202, "FALLBACK LIST where every file is broken")
     expect(amcp, "PLAY 1-10 clipb LENGTH 10 TAG r5", 202, "PLAY r5")
     check("no filler opens: stalled (fallback)", wait_event(amcp, seq, "stalled", "dead", 8))
@@ -290,9 +291,31 @@ def scenario_broken(amcp, osc):
           str(info["foreground"]))
     expect(amcp, "CLEAR 1-10", 202, "CLEAR after the dead list")
 
+    # F-e: a clip set before the list stays as the slate and airs when every filler fails.
+    seq = last_seq(amcp)
+    expect(amcp, "FALLBACK 1-10 slate LOOP TAG dead", 202, "FALLBACK <clip> before the dead list (the slate)")
+    expect(amcp, 'FALLBACK 1-10 LIST "fillers_dead" TAG dead', 202, "FALLBACK LIST keeps the clip as the slate")
+    info = json_reply(amcp, "QUEUE 1-10 INFO")["fallback"]
+    check("QUEUE INFO: mode list with the slate", info["mode"] == "list" and info["slate"] == "slate", str(info))
+    expect(amcp, "PLAY 1-10 clipb LENGTH 10 TAG r5b", 202, "PLAY r5b")
+    check("no filler opens: stalled (fallback slate)", wait_event(amcp, seq, "stalled", "dead", 8))
+    events = events_after(amcp, seq)
+    stalled = [e for e in events if e["kind"] == "stalled"]
+    check("stalled reason is fallback slate", stalled and stalled[0]["reason"] == "fallback slate", str(stalled[:1]))
+    check("the slate goes on air", wait_event(amcp, seq, "onair", "dead", 3))
+    info = json_reply(amcp, "QUEUE 1-10 INFO")
+    check("QUEUE INFO: the slate is current", info["fallback"]["active"] and info["fallback"]["current"] == "slate",
+          str(info["fallback"]))
+    expect(amcp, "PLAY 1-10 clipa LENGTH 10 TAG r5c", 202, "PLAY replaces the slate")
+    check("r5c replaces the slate", wait_event(amcp, seq, "onair", "r5c", 3))
+    expect(amcp, "CLEAR 1-10", 202, "CLEAR after the slate")
+    expect(amcp, "FALLBACK 1-10 CLEAR", 202, "FALLBACK CLEAR removes list and slate")
+    info = json_reply(amcp, "QUEUE 1-10 INFO")["fallback"]
+    check("QUEUE INFO after FALLBACK CLEAR: no slate", not info["set"] and info.get("slate") is None, str(info))
+
 
 def scenario_shuffle(amcp, osc):
-    """SHUFFLE with NOREPEAT: no file comes back within n picks; LIST and clip replace each other."""
+    """SHUFFLE with NOREPEAT: no file comes back within n picks; a clip replaces LIST, LIST keeps it."""
     seq = last_seq(amcp)
     expect(amcp, 'FALLBACK 1-10 LIST "fillers" SHUFFLE NOREPEAT 2 TAG shf', 202, "FALLBACK LIST SHUFFLE NOREPEAT 2")
     expect(amcp, "PLAY 1-10 clipa LENGTH 10 TAG r6", 202, "PLAY r6")
@@ -308,9 +331,10 @@ def scenario_shuffle(amcp, osc):
     info = json_reply(amcp, "QUEUE 1-10 INFO")["fallback"]
     check("QUEUE INFO: mode clip after FALLBACK <clip>", info["mode"] == "clip" and info["files"] == 1, str(info))
     check("the clip follows the running filler", wait_event(amcp, seq, "onair", "slate", 3))
-    expect(amcp, 'FALLBACK 1-10 LIST "fillers" TAG fill2', 202, "FALLBACK LIST replaces the clip")
+    expect(amcp, 'FALLBACK 1-10 LIST "fillers" TAG fill2', 202, "FALLBACK LIST keeps the clip as the slate")
     info = json_reply(amcp, "QUEUE 1-10 INFO")["fallback"]
-    check("QUEUE INFO: mode list after FALLBACK LIST", info["mode"] == "list" and info["files"] == 4, str(info))
+    check("QUEUE INFO: mode list after FALLBACK LIST, clip kept as slate",
+          info["mode"] == "list" and info["files"] == 4 and info["slate"] == "slate", str(info))
     expect(amcp, "CLEAR 1-10", 202, "CLEAR after shuffle")
     expect(amcp, "FALLBACK 1-10 CLEAR", 202, "FALLBACK CLEAR at the end")
     info = json_reply(amcp, "QUEUE 1-10 INFO")["fallback"]

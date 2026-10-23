@@ -207,8 +207,10 @@ air in these cases:
   `FALLBACK LIST 500` when it opens but fails or decodes nothing; `file` = the file name), and the next
   file is tried at once. This happens while the filler before it plays, so the skip has no gap when
   that filler is longer than about 1 s. ffmpeg accepts an unreadable `.mov` and fails inside its own
-  thread, so most broken files are found by the 1 s limit. When every file fails, the layer holds its
-  last frame and reports `stalled (fallback)` once; the folder is tried again every 5 s.
+  thread, so most broken files are found by the 1 s limit. When every file fails, the layer reports
+  `stalled` once and airs the slate (below), reason `fallback slate`; without a slate it holds its
+  last frame, reason `fallback`. The folder is tried again every 5 s, and the next filler that opens
+  replaces the slate.
 - Each filler goes on air as its own item, tagged `<tag>:<n>`, where `<n>` counts the fillers aired
   since the list was set (`fallback:1`, `fallback:2`, …). Its events carry the file name in the field
   `file`. The first filler comes on air with the reason of the failover (`ended`, `stall`, `error`);
@@ -217,9 +219,10 @@ air in these cases:
 - An AUTO item (`QUEUE … AUTO`, `LOADBG … AUTO`) or `PLAY` replaces the running filler on the next
   frame, as with a single clip. When that item ends with nothing behind it, the fillers come back.
 - A stalled filler is replaced by the next filler.
-- `LIST` replaces a single-clip fallback and the other way round. The filler on air plays to its end;
-  then the new fallback follows. `FALLBACK CLEAR` removes the list; the filler on air plays to its end
-  and its last frame holds.
+- The slate: a `FALLBACK <clip>` sent before `LIST` stays set, as the second line behind the fillers.
+  A `FALLBACK <clip>` sent after `LIST` replaces the list. The filler on air plays to its end; then the
+  new fallback follows. `FALLBACK CLEAR` removes the list and the slate; the filler on air plays to its
+  end and its last frame holds.
 - The files are listed when the command arrives. Run `FALLBACK LIST` again after changing the folder.
 
 ### 3.6 Events
@@ -295,7 +298,7 @@ Reply `201 QUEUE INFO OK` and one line of JSON:
 {"channel":1,"layer":10,"instance":1792065829887,"frame":553,"event_seq":14,
  "foreground":{"tag":"a","producer":"ffmpeg","frame":5,"frames":50,"paused":false,"starting":false},
  "waiting":[{"tag":"b","producer":"transition","auto":true},{"tag":"c","producer":"transition","auto":true}],
- "fallback":{"set":true,"tag":"slate","active":false,"stall":50,"mode":"clip","files":1,"current":null}}
+ "fallback":{"set":true,"tag":"slate","active":false,"stall":50,"mode":"clip","files":1,"current":null,"slate":null}}
 ```
 
 - `foreground` is `null` when the layer does not exist. `frames` is `-1` for an endless producer.
@@ -304,7 +307,8 @@ Reply `201 QUEUE INFO OK` and one line of JSON:
 - `waiting` lists the background first, then the queue.
 - `fallback.mode` is `"list"` after `FALLBACK LIST`, else `"clip"`. `files` is the number of files in
   the list (1 for a clip, 0 when no fallback is set). `current` is the file on air while the fallback
-  is active: the filler's file name, or the `<clip>` as given; `null` otherwise. With fillers,
+  is active: the filler's file name, or the `<clip>` as given (also the slate); `null` otherwise.
+  `slate` is the `<clip>` kept behind a list, else `null`. With fillers,
   `foreground.tag` is `<tag>:<n>`.
 
 **EXPECT.** `EXPECT <tag>` runs the command only when `<tag>` is the layer's foreground (the
